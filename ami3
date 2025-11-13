@@ -1,0 +1,443 @@
+# =============================================================
+# MLCE_{group_name}_BO.py — Batch Bayesian Optimisation (GP + EI + KB)
+# =============================================================
+from datetime import datetime
+import random
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+import sys, os
+import matplotlib.pyplot as plt
+import scipy
+
+
+
+# -------------------------------------------------------------
+# Ensure the coursework package is importable
+# (adjust path if your repo lives elsewhere)
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    "C:\Imperial\Year 4\ML\Bayesian Batch Optimisation\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+
+# Virtual bioprocess simulator
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+def objective_func(X):
+    """Wrapper: returns numpy array of titres for a batch of native points."""
+    return np.array(virtual_lab.conduct_experiment(X))
+
+# -------------------------------------------------------------
+# Group information
+# -------------------------------------------------------------
+group_names     = ['Name 1','Name 2']
+cid_numbers     = ['000000','111111']
+oral_assessment = [0, 1]
+
+# -------------------------------------------------------------
+# Helper Class (kept to match example file)
+# -------------------------------------------------------------
+class RandomSelection:
+    def __init__(self, X_searchspace, objective_func, batch):
+        self.X_searchspace = X_searchspace
+        self.batch         = batch
+        random_searchspace = [self.X_searchspace[random.randrange(len(self.X_searchspace))] for _ in range(batch)]
+        self.random_Y      = objective_func(random_searchspace)
+
+# -------------------------------------------------------------
+# Lightweight GP (RBF + white noise)
+# -------------------------------------------------------------
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+from typing import Optional, Sequence
+
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+from typing import Optional, Tuple, Callable
+
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+import warnings
+
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+import warnings
+
+class _SimpleGP:
+    """
+    Lightweight Gaussian Process using RBF kernel with white noise.
+    - Continuous (5D) and categorical (3D one-hot) inputs.
+    - Hyperparameters: lengthscales (cont + cat), signal variance, noise variance.
+    """
+
+    def __init__(self):
+        self.X = None
+        self.y = None
+        self.theta = None
+        self.L = None
+        self.alpha = None
+
+    # ----------------------------------------------------------
+    # RBF kernel (handles continuous + categorical)
+    # ----------------------------------------------------------
+    def _kernel(self, XA, XB, ell_cont, ell_cat, sigma2):
+        XA, XB = np.asarray(XA, float), np.asarray(XB, float)
+        XA_c, XA_k = XA[:, :5], XA[:, 5:]
+        XB_c, XB_k = XB[:, :5], XB[:, 5:]
+
+        # Continuous dimensions
+        A_c = XA_c / (ell_cont + 1e-12)
+        B_c = XB_c / (ell_cont + 1e-12)
+        d2_c = np.sum(A_c**2, axis=1)[:, None] + np.sum(B_c**2, axis=1)[None, :] - 2.0 * (A_c @ B_c.T)
+
+        # Categorical (one-hot) dimensions
+        A_k = XA_k / (ell_cat + 1e-12)
+        B_k = XB_k / (ell_cat + 1e-12)
+        d2_k = np.sum(A_k**2, axis=1)[:, None] + np.sum(B_k**2, axis=1)[None, :] - 2.0 * (A_k @ B_k.T)
+
+        return sigma2 * np.exp(-0.5 * (d2_c + d2_k))
+
+    # ----------------------------------------------------------
+    # Negative log marginal likelihood
+    # ----------------------------------------------------------
+    def _neg_log_mll(self, logtheta):
+        log_ell_cont, log_ell_cat, log_sigma, log_noise = logtheta
+        ell_cont, ell_cat = np.exp(log_ell_cont), np.exp(log_ell_cat)
+        sigma2, noise2 = np.exp(2.0 * log_sigma), np.exp(2.0 * log_noise)
+
+        K = self._kernel(self.X, self.X, ell_cont, ell_cat, sigma2)
+        n = len(self.X)
+        K[np.diag_indices(n)] += noise2 + 1e-10
+
+        try:
+            L, lower = cho_factor(K, lower=True, check_finite=False)
+            alpha = cho_solve((L, lower), self.y, check_finite=False)
+            logdet = 2.0 * np.sum(np.log(np.diag(L)))
+            return 0.5 * (self.y @ alpha) + 0.5 * logdet + 0.5 * n * np.log(2.0 * np.pi)
+        except np.linalg.LinAlgError:
+            return 1e50
+
+    # ----------------------------------------------------------
+    # Fit GP to data (optionally optimize hyperparameters)
+    # ----------------------------------------------------------
+    def fit(self, X_enc, y, optimize_hyperparams=True, maxfun=60):
+        self.X = np.asarray(X_enc, float)
+        self.y = np.asarray(y, float)
+
+        if self.theta is None:
+            # [log_ell_cont, log_ell_cat, log_sigma, log_noise]
+            self.theta = np.array([np.log(0.5), np.log(0.5), np.log(1.0), np.log(1e-2)])
+
+        if optimize_hyperparams and len(self.y) >= 6:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                res = minimize(
+                    self._neg_log_mll, self.theta,
+                    method='L-BFGS-B',
+                    options={'maxfun': maxfun, 'ftol': 1e-6}
+                )
+                if res.success:
+                    self.theta = res.x
+
+        log_ell_cont, log_ell_cat, log_sigma, log_noise = self.theta
+        ell_cont, ell_cat = np.exp(log_ell_cont), np.exp(log_ell_cat)
+        sigma2, noise2 = np.exp(2.0 * log_sigma), np.exp(2.0 * log_noise)
+
+        K = self._kernel(self.X, self.X, ell_cont, ell_cat, sigma2)
+        n = len(self.X)
+        K[np.diag_indices(n)] += noise2 + 1e-10
+
+        self.L, lower = cho_factor(K, lower=True, check_finite=False)
+        self.alpha = cho_solve((self.L, lower), self.y, check_finite=False)
+
+    # ----------------------------------------------------------
+    # Prediction
+    # ----------------------------------------------------------
+    def predict(self, Xstar_enc):
+        Xstar_enc = np.asarray(Xstar_enc, float)
+        log_ell_cont, log_ell_cat, log_sigma, _ = self.theta
+        ell_cont, ell_cat = np.exp(log_ell_cont), np.exp(log_ell_cat)
+        sigma2 = np.exp(2.0 * log_sigma)
+
+        Kxs = self._kernel(Xstar_enc, self.X, ell_cont, ell_cat, sigma2)
+        mu = Kxs @ self.alpha
+
+        v = cho_solve((self.L, True), Kxs.T, check_finite=False)
+        kss = sigma2 * np.ones(Xstar_enc.shape[0])
+        var = kss - np.sum(Kxs * v.T, axis=1)
+        std = np.sqrt(np.maximum(var, 1e-12))
+        return mu, std
+
+    # ----------------------------------------------------------
+    # Create believer copy (for batch Bayesian optimization)
+    # ----------------------------------------------------------
+    def clone_believer(self):
+        new_gp = _SimpleGP()
+        new_gp.X = self.X.copy()
+        new_gp.y = self.y.copy()
+        new_gp.theta = self.theta.copy()
+        new_gp.L = self.L.copy()
+        new_gp.alpha = self.alpha.copy()
+        return new_gp
+    # ----------------------------------------------------------
+    # Recompute factorization with fixed hyperparameters
+    # (used by Kriging Believer in batch BO)
+    # ----------------------------------------------------------
+    def _refactor_fixed_theta(self):
+        """Recompute L and alpha using current X, y, and theta (no optimization)."""
+        if self.theta is None or self.X is None or self.y is None:
+            raise ValueError("GP must be fitted before refactoring.")
+
+        log_ell_cont, log_ell_cat, log_sigma, log_noise = self.theta
+        ell_cont, ell_cat = np.exp(log_ell_cont), np.exp(log_ell_cat)
+        sigma2, noise2 = np.exp(2.0 * log_sigma), np.exp(2.0 * log_noise)
+
+        K = self._kernel(self.X, self.X, ell_cont, ell_cat, sigma2)
+        n = len(self.X)
+        K[np.diag_indices(n)] += noise2 + 1e-10
+
+        self.L, lower = cho_factor(K, lower=True, check_finite=False)
+        self.alpha = cho_solve((self.L, lower), self.y, check_finite=False)
+
+
+
+# -------------------------------------------------------------
+# EI acquisition 
+# -------------------------------------------------------------
+def _erf_approx(z):
+    sign = np.sign(z)
+    x = np.abs(z)
+    p = 0.3275911
+    a1,a2,a3,a4,a5 = 0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429
+    t = 1.0/(1.0 + p*x)
+    poly = (((a5*t + a4)*t + a3)*t + a2)*t + a1
+    y = 1.0 - poly * np.exp(-x*x)
+    return sign * y
+
+def _expected_improvement(mu, std, f_best, eps=1e-9):
+    std = np.maximum(std, eps)
+    z = (mu - f_best) / std
+    pdf = scipy.stats.norm.pdf(z)
+    cdf= scipy.stats.norm.cdf(z)
+    ei = (mu - f_best) * cdf + std * pdf
+    ei[std < eps] = 0.0
+    return ei
+
+# -------------------------------------------------------------
+# BO class (matches example style: runs in __init__, tracks time)
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_initial, X_searchspace, iterations, batch, objective_func):
+        start_time = datetime.timestamp(datetime.now())
+
+        self.X_initial     = X_initial
+        self.X_searchspace = X_searchspace
+        self.iterations    = iterations
+        self.batch         = batch
+
+        # Initial evaluation and timing format like the example
+        self.Y     = objective_func(self.X_initial)
+        self.time  = [datetime.timestamp(datetime.now()) - start_time]
+        self.time += [0] * (len(self.X_initial) - 1)
+        start_time = datetime.timestamp(datetime.now())
+
+        # Bounds for scaling (from grids)
+        self.bounds = {
+            'temp': (30.0, 40.0),
+            'pH':   (6.0, 8.0),
+            'f1':   (0.0, 50.0),
+            'f2':   (0.0, 50.0),
+            'f3':   (0.0, 50.0),
+        }
+        self.celltypes = ['celltype_1','celltype_2','celltype_3']
+
+        # Encode pool; mark already evaluated
+        self.pool_native = list(self.X_searchspace)
+        self.pool_enc    = self._encode_batch(self.pool_native)
+        done = set(tuple(x) for x in self.X_initial)
+        self.taken_mask = np.array([tuple(x) in done for x in self.pool_native], dtype=bool)
+
+        # Fit initial GP
+        self.gp = _SimpleGP()
+        X0_enc = self._encode_batch(self.X_initial)
+        self.gp.fit(X0_enc, self.Y, optimize_hyperparams=True)
+
+        # Main loop
+        for self.iteration in range(iterations):
+            y_best = float(np.max(self.Y))
+            batch_points, chosen_idx = self._select_batch_kb(y_best, self.batch, self.taken_mask.copy())
+            if len(batch_points) == 0:
+                break
+
+            Y_new = objective_func(batch_points)
+            self.Y = np.concatenate([self.Y, Y_new])
+
+            for idx in chosen_idx:
+                self.taken_mask[idx] = True
+
+            # timing pattern: leader time + zeros
+            self.time += [datetime.timestamp(datetime.now()) - start_time]
+            self.time += [0] * (len(Y_new) - 1)
+            start_time = datetime.timestamp(datetime.now())
+
+            # Refit GP; re-optimise occasionally
+            X_all_native = self._history_native(self.pool_native, self.taken_mask, self.X_initial)
+            X_all_enc    = self._encode_batch(X_all_native)
+            opt_h = (len(self.Y) >= 12 and self.iteration % 3 == 0)
+            self.gp.fit(X_all_enc, self.Y, optimize_hyperparams=opt_h)
+
+    # ---------- encoding helpers ----------
+    def _one_hot_celltype(self, ct):
+        oh = np.zeros(3)
+        oh[self.celltypes.index(ct)] = 1.0
+        return oh
+
+    def _scale(self, x, lo, hi):
+        return (float(x) - lo) / (hi - lo + 1e-12)
+
+    def _encode_point(self, x_native):
+        t, pH, f1, f2, f3, ct = x_native
+        cont = np.array([
+            self._scale(t,  *self.bounds['temp']),
+            self._scale(pH, *self.bounds['pH']),
+            self._scale(f1, *self.bounds['f1']),
+            self._scale(f2, *self.bounds['f2']),
+            self._scale(f3, *self.bounds['f3']),
+        ])
+        cat = self._one_hot_celltype(ct)
+        return np.concatenate([cont, cat], axis=0)
+
+    def _encode_batch(self, X_native):
+        return np.vstack([self._encode_point(x) for x in X_native])
+
+    # ---------- batch selection: EI + Kriging Believer ----------
+    def _select_batch_kb(self, y_best, batch_size, taken_mask_copy):
+        chosen_idxs = []
+
+        believer = _SimpleGP()
+        believer.X = self.gp.X.copy()
+        believer.y = self.gp.y.copy()
+        believer.theta = self.gp.theta
+        believer.L = self.gp.L
+        believer.alpha = self.gp.alpha
+
+        for _ in range(batch_size):
+            valid = ~taken_mask_copy
+            if not np.any(valid):
+                break
+            mu, std = believer.predict(self.pool_enc[valid])
+            ei = _expected_improvement(mu, std, y_best)
+            if np.all(ei <= 0.0):
+                # fallback to random unexplored points if EI is flat
+                j_pool = np.random.choice(np.where(valid)[0])
+            else:
+                j_valid = int(np.argmax(ei))
+                j_pool  = np.where(valid)[0][j_valid]
+
+
+            j_valid = int(np.argmax(ei))
+            j_pool  = np.where(valid)[0][j_valid]
+
+            x_new_enc = self.pool_enc[j_pool:j_pool+1]
+            mu_new, _ = believer.predict(x_new_enc)
+
+            believer.X = np.vstack([believer.X, x_new_enc])
+            believer.y = np.concatenate([believer.y, mu_new])
+            believer._refactor_fixed_theta()
+
+            taken_mask_copy[j_pool] = True
+            chosen_idxs.append(j_pool)
+
+        batch_native = [self.pool_native[i] for i in chosen_idxs]
+        return batch_native, chosen_idxs
+
+    def _history_native(self, pool_native, taken_mask, X_initial):
+        xset = list(X_initial)
+        init_set = set(tuple(xx) for xx in X_initial)
+        for take, x in zip(taken_mask, pool_native):
+            if take and (tuple(x) not in init_set):
+                xset.append(x)
+        return xset
+
+# -------------------------------------------------------------
+# Execution Block (mirrors the example)
+# -------------------------------------------------------------
+X_initial = ([[33, 6.25, 10, 20, 20, 'celltype_1'],
+              [38, 8.00, 20, 10, 20, 'celltype_3'],
+              [37, 6.80,  0, 50,  0, 'celltype_1'],
+              [36, 6.00, 20, 20, 10, 'celltype_2']])
+
+temp = np.linspace(30, 40, 5)
+pH   = np.linspace(6, 8, 5)
+f1   = np.linspace(0, 50, 5)
+f2   = np.linspace(0, 50, 5)
+f3   = np.linspace(0, 50, 5)
+celltype = ['celltype_1','celltype_2','celltype_3']
+
+X_searchspace = [[a, b, c, d, e, f] for a in temp for b in pH for c in f1 for d in f2 for e in f3 for f in celltype]
+
+BO_m = BO(X_initial, X_searchspace, 15, 5, objective_func)
+
+# -------------------------------------------------------------
+# Simple summary printout
+# -------------------------------------------------------------
+try:
+    init_list = list(BO_m.X_initial)
+    init_set  = set(tuple(x) for x in init_list)
+    selected_from_pool = [x for take, x in zip(BO_m.taken_mask, BO_m.pool_native)
+                          if take and (tuple(x) not in init_set)]
+    X_history_native = init_list + selected_from_pool
+
+    best_idx = int(np.argmax(BO_m.Y))
+    best_x   = X_history_native[best_idx]
+    best_y   = float(BO_m.Y[best_idx])
+
+    n_evals    = len(BO_m.Y)
+    total_time = float(sum(BO_m.time))
+
+    print("=== BO Summary ===")
+    print(f"Evaluations (batches): {BO_m.iterations}")
+    print(f"Total data points: {len(BO_m.Y)}")
+    print(f"Best titre:  {best_y:.6g}")
+    print(f"Best point:  {best_x}")
+    print(f"Total time:  {total_time:.3f} s")
+
+    last_batch = min(BO_m.batch, n_evals - len(BO_m.X_initial))
+    if last_batch > 0:
+        print("Last batch Y:", BO_m.Y[-last_batch:])
+except Exception as e:
+    print("Summary print failed:", repr(e))
+
+# -------------------------------------------------------------
+# Plot cumulative best (titre concentration improvement)
+# -------------------------------------------------------------
+try:
+    # Compute cumulative best after each evaluation
+    cum_best = np.maximum.accumulate(BO_m.Y)
+
+    plt.figure(figsize=(7,4))
+    plt.plot(range(1, len(cum_best)+1), cum_best, marker='o', linewidth=2)
+    plt.xlabel("Evaluation Number")
+    plt.ylabel("Cumulative Best Titre")
+    plt.title("Bayesian Optimisation Progress")
+    plt.grid(True, linestyle='--', alpha=0.6)
+
+    # Optional: show or save
+    plt.tight_layout()
+    plt.show()
+    # To save instead of showing:
+    # plt.savefig("cumulative_titre_plot.png", dpi=150)
+except Exception as e:
+    print("Plotting failed:", repr(e))
