@@ -8,6 +8,8 @@ from scipy.linalg import cho_factor, cho_solve
 from scipy.optimize import minimize
 import sys, os
 import matplotlib.pyplot as plt
+import scipy
+
 
 
 # -------------------------------------------------------------
@@ -157,8 +159,8 @@ def _erf_approx(z):
 def _expected_improvement(mu, std, f_best, eps=1e-9):
     std = np.maximum(std, eps)
     z = (mu - f_best) / std
-    pdf = np.exp(-0.5 * z**2) / np.sqrt(2.0 * np.pi)
-    cdf = 0.5 * (1.0 + _erf_approx(z / np.sqrt(2.0)))
+    pdf = scipy.stats.norm.pdf(z)
+    cdf= scipy.stats.norm.cdf(z)
     ei = (mu - f_best) * cdf + std * pdf
     ei[std < eps] = 0.0
     return ei
@@ -369,3 +371,4 @@ try:
     # plt.savefig("cumulative_titre_plot.png", dpi=150)
 except Exception as e:
     print("Plotting failed:", repr(e))
+
