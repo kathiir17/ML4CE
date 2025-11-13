@@ -10,13 +10,14 @@ from scipy.spatial.distance import cdist
 import sobol_seq
 import sys, os
 import matplotlib.pyplot as plt
+import scipy
 
 # -------------------------------------------------------------
 # Ensure the coursework package is importable
 # (adjust path if your repo lives elsewhere)
 # -------------------------------------------------------------
 sys.path.append(os.path.abspath(
-    "C:/Users/medea155045/PythonProject/Imperial-ML4CE-Course/BatchBayesianOptimization"
+    "C:\Imperial\Year 4\ML\Bayesian Batch Optimisation\Imperial-ML4CE-Course\BatchBayesianOptimization"
 ))
 
 # Virtual bioprocess simulator
@@ -234,8 +235,8 @@ def _erf_approx(z):
 def _expected_improvement(mu, std, f_best, eps=1e-9):
     std = np.maximum(std, eps)
     z = (mu - f_best) / std
-    pdf = np.exp(-0.5 * z**2) / np.sqrt(2.0 * np.pi)
-    cdf = 0.5 * (1.0 + _erf_approx(z / np.sqrt(2.0)))
+    pdf = scipy.stats.norm.pdf(z)
+    cdf = scipy.stats.norm.cdf(z)
     ei = (mu - f_best) * cdf + std * pdf
     ei[std < eps] = 0.0
     return ei
@@ -305,7 +306,11 @@ class BO:
 
             ei = _expected_improvement(mu, std, y_best)
             if np.all(ei <= 0.0):
-                break
+                # fallback to random unexplored points if EI is flat
+                j_pool = np.random.choice(np.where(valid)[0])
+            else:
+                j_valid = int(np.argmax(ei))
+                j_pool  = np.where(valid)[0][j_valid]
 
             # pick top 'batch' EI points
             n_valid = len(valid_indices)
@@ -399,7 +404,8 @@ try:
     total_time = float(sum(BO_m.time))
 
     print("=== BO Summary ===")
-    print(f"Evaluations: {n_evals}")
+    print(f"Evaluations (batches): {BO_m.iterations}")
+    print(f"Total data points: {len(BO_m.Y)}")
     print(f"Best titre:  {best_y:.6g}")
     print(f"Best point:  {best_x}")
     print(f"Total time:  {total_time:.3f} s")
