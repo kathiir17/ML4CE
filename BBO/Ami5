@@ -1,0 +1,171 @@
+# =============================================================
+# MLCE_Group_BO_VirtualLab_Synced.py
+# Strategy: Matern 5/2 + Adaptive Zoom + Basin Locking
+# =============================================================
+
+import sys, os, random
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from scipy.linalg import cho_factor, cho_solve
+from sobol_seq import i4_sobol
+
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+# -------------------------------------------------------------
+# Objective
+# -------------------------------------------------------------
+def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(
+        virtual_lab.conduct_experiment(X, initial_conditions=custom_init)
+    )
+
+# -------------------------------------------------------------
+# Gaussian Process
+# -------------------------------------------------------------
+class _SimpleGP:
+    def __init__(self):
+        self.theta = np.log([0.3, 0.3, 1.0, 1e-5])
+
+    def _kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5]/lc, A[:, 5:]/lk
+        B1, B2 = B[:, :5]/lc, B[:, 5:]/lk
+        sq = np.sum(A1**2,1)[:,None] + np.sum(B1**2,1)[None,:] - 2*A1@B1.T
+        sq += np.sum(A2**2,1)[:,None] + np.sum(B2**2,1)[None,:] - 2*A2@B2.T
+        sq = np.maximum(sq,0)
+        d = np.sqrt(sq)
+        sd = np.sqrt(5)*d
+        return s2*(1+sd+5*d*d/3)*np.exp(-sd)
+
+    def fit(self, X, y):
+        self.X = X
+        self.y = y
+        self.m = np.mean(y)
+        self.s = np.std(y) if np.std(y)>1e-9 else 1.0
+        yn = (y-self.m)/self.s
+
+        lc, lk, ls, ln = self.theta
+        K = self._kernel(X,X,np.exp(lc),np.exp(lk),np.exp(2*ls))
+        K[np.diag_indices(len(X))] += np.exp(2*ln)+1e-10
+        self.L,_ = cho_factor(K, lower=True)
+        self.a = cho_solve((self.L,True), yn)
+
+    def predict(self, Xs):
+        lc, lk, ls,_ = self.theta
+        Kxs = self._kernel(Xs,self.X,np.exp(lc),np.exp(lk),np.exp(2*ls))
+        mu = Kxs@self.a
+        v = cho_solve((self.L,True),Kxs.T)
+        var = np.exp(2*ls)-np.sum(Kxs*v.T,1)
+        return mu*self.s+self.m, np.sqrt(np.maximum(var,1e-12))*self.s
+
+# -------------------------------------------------------------
+# BO
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch):
+        self.bounds = {'temp':(30,40),'pH':(6,8),'f1':(0,50),'f2':(0,50),'f3':(0,50)}
+        self.celltypes = ['celltype_1','celltype_2','celltype_3']
+
+        self.pool = X_pool
+        self.taken = np.zeros(len(X_pool), bool)
+
+        # ✅ Explicit observation storage (FIX)
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        self.batch_best = []
+        self.batch_sum = []
+
+        self.enc_pool = self._encode_batch(X_pool)
+        self.gp = _SimpleGP()
+        self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
+
+        for it in range(iters):
+
+            if it % 5 == 0:
+                idx = np.random.choice(np.where(~self.taken)[0], batch, replace=False)
+            else:
+                mu, std = self.gp.predict(self.enc_pool)
+                idx = np.argsort(mu + 2*std)[-batch:]
+
+            Xn = [self.pool[i] for i in idx]
+            Yn = objective_func(Xn)
+
+            self.batch_best.append(float(np.max(Yn)))
+            self.batch_sum.append(float(np.sum(Yn)))
+
+            self.X_obs.extend(Xn)
+            self.Y.extend(Yn.tolist())
+
+            for i in idx:
+                self.taken[i] = True
+
+            self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
+
+    def _encode_point(self,x):
+        t,pH,f1,f2,f3,ct=x
+        cont=[(t-30)/10,(pH-6)/2,f1/50,f2/50,f3/50]
+        cat=[1 if ct==c else 0 for c in self.celltypes]
+        return np.array(cont+cat)
+
+    def _encode_batch(self,X):
+        return np.vstack([self._encode_point(x) for x in X])
+
+# -------------------------------------------------------------
+# Run BO
+# -------------------------------------------------------------
+bounds = np.array([[30,40],[6,8],[0,50],[0,50],[0,50]])
+celltypes = ['celltype_1','celltype_2','celltype_3']
+
+def make_init(n=6):
+    X=[]
+    for i in range(n):
+        u,_=i4_sobol(5,i)
+        c=bounds[:,0]+u*(bounds[:,1]-bounds[:,0])
+        X.append([*c,celltypes[i%3]])
+    return X
+
+def make_pool(n=3000):
+    X=[]
+    for i in range(n):
+        u,_=i4_sobol(5,i+100)
+        c=bounds[:,0]+u*(bounds[:,1]-bounds[:,0])
+        X.append([*c,random.choice(celltypes)])
+    return X
+
+bo = BO(make_init(), make_pool(), 15, 5)
+
+# -------------------------------------------------------------
+# Batch plots
+# -------------------------------------------------------------
+b = np.arange(1, len(bo.batch_best)+1)
+
+plt.figure()
+plt.plot(b, bo.batch_best, marker='o')
+plt.xlabel("Batch")
+plt.ylabel("Best Titre")
+plt.title("Best Titre per Batch")
+plt.grid()
+plt.show()
+
+batch_best = np.array(bo.batch_best)
+cum_batch_best = np.cumsum(batch_best)
+
+batches = np.arange(1, len(batch_best) + 1)
+
+plt.figure(figsize=(7, 4))
+plt.plot(batches, cum_batch_best, linewidth=2, color='black')
+plt.xlabel("Batch")
+plt.ylabel("Cumulative Best Titre [g/L]")
+plt.title("Cumulative Sum of Best Titre per Batch")
+plt.grid(True, linestyle='--')
+plt.show()
+
+
+print("\n=== BO RESULT ===")
+print(f"Best overall titre: {max(bo.batch_best):.4f}")
+print(f"Best batch: {np.argmax(bo.batch_best)+1}")
