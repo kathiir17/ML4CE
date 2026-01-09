@@ -1,0 +1,362 @@
+# =============================================================
+# MLCE_Group_BO_VirtualLab_Improved.py
+# Strategy:
+#   Gaussian Process surrogate
+#   Expected Improvement acquisition
+#   Kriging Believer for batch BO
+#   ML-II (maximum marginal likelihood) hyperparameter learning
+# =============================================================
+
+# -----------------------
+# Standard imports
+# -----------------------
+import sys, os, random, time
+import numpy as np
+import matplotlib.pyplot as plt
+
+# GP-related numerical routines
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+from scipy.stats import norm
+
+# Sobol sequence for space-filling designs
+from sobol_seq import i4_sobol
+
+
+# -------------------------------------------------------------
+# Import the virtual lab environment
+# -------------------------------------------------------------
+# Add the coursework directory to Python path
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+
+# Import the virtual lab simulator
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+# -------------------------------------------------------------
+# Objective function wrapper
+# -------------------------------------------------------------
+# This function is what BO actually optimises.
+# It takes a list of experiments X and returns the measured titres.
+def objective_func(X):
+    return np.array(
+        virtual_lab.conduct_experiment(X)
+    )
+
+
+# =============================================================
+# Gaussian Process Model
+# - ARD kernel for continuous inputs
+# - Explicit handling of categorical variables (cell type)
+# =============================================================
+class GP:
+    def __init__(self):
+        # Log-parameters to ensure positivity:
+        # 5 continuous ARD lengthscales
+        # 1 categorical lengthscale
+        # 1 signal variance
+        # 1 noise variance
+        self.theta = np.log([1, 1, 1, 1, 1, 1, 1.0, 1e-4])
+
+    # ---------------------------------------------------------
+    # Matérn 5/2 kernel with ARD + categorical distance
+    # ---------------------------------------------------------
+    def kernel(self, A, B, lc, lk, s2):
+        # ---- Continuous inputs (first 5 dimensions) ----
+        # Divide each dimension by its own lengthscale (ARD)
+        A1 = A[:, :5] / lc
+        B1 = B[:, :5] / lc
+
+        # Squared Euclidean distance
+        sq = (
+            np.sum(A1**2, 1)[:, None]
+            + np.sum(B1**2, 1)[None, :]
+            - 2 * A1 @ B1.T
+        )
+
+        # ---- Categorical inputs (one-hot encoded cell types) ----
+        A2, B2 = A[:, 5:], B[:, 5:]
+
+        # Hamming distance between one-hot vectors
+        cat_dist = (A2[:, None, :] != B2[None, :, :]).sum(axis=2)
+
+        # Scale categorical distance by categorical lengthscale
+        sq += cat_dist / lk
+
+        # Numerical safety
+        sq = np.maximum(sq, 0)
+
+        # Matérn 5/2 formulation
+        d = np.sqrt(sq)
+        sd = np.sqrt(5) * d
+
+        return s2 * (1 + sd + 5*d*d/3) * np.exp(-sd)
+
+    # ---------------------------------------------------------
+    # Negative log marginal likelihood (ML-II objective)
+    # ---------------------------------------------------------
+    def neg_log_mll(self, theta):
+        # Unpack parameters
+        lc = np.exp(theta[:5])                          # ARD lengthscales
+        lk = np.exp(theta[5])                           # categorical lengthscale
+        s2 = np.exp(2 * theta[6])                       # signal variance
+        ln = min(np.exp(2 * self.theta[7]), 0.05)       # noise variance
+
+        # Kernel matrix
+        K = self.kernel(self.X, self.X, lc, lk, s2)
+
+        # Add noise + jitter for numerical stability
+        K[np.diag_indices(len(self.X))] += ln + 1e-6
+
+        # Cholesky decomposition
+        L, _ = cho_factor(K, lower=True)
+        alpha = cho_solve((L, True), self.y)
+
+        # Standard GP marginal likelihood
+        return (
+            0.5 * self.y @ alpha
+            + np.sum(np.log(np.diag(L)))
+            + 0.5 * len(self.y) * np.log(2 * np.pi)
+        )
+
+    # ---------------------------------------------------------
+    # Fit GP hyperparameters and cache factorisation
+    # ---------------------------------------------------------
+    def fit(self, X, y):
+        # Store training inputs
+        self.X = X
+
+        # Standardise targets (important for GP stability)
+        self.m = np.mean(y)
+        self.s = np.std(y) if np.std(y) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        # Bounds to prevent pathological hyperparameters
+        bounds = [(-3, 3)] * 6 + [(-3, 3), (-10, 0)]
+
+        # ML-II optimisation
+        res = minimize(self.neg_log_mll, self.theta, bounds=bounds)
+        self.theta = res.x
+
+        # Recompute kernel with optimal parameters
+        lc = np.exp(self.theta[:5])
+        lk = np.exp(self.theta[5])
+        s2 = np.exp(2 * self.theta[6])
+        ln = np.exp(2 * self.theta[7])
+
+        K = self.kernel(X, X, lc, lk, s2)
+        K[np.diag_indices(len(X))] += ln + 1e-6
+
+        # Cache Cholesky and alpha for fast prediction
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    # ---------------------------------------------------------
+    # GP prediction: posterior mean and standard deviation
+    # ---------------------------------------------------------
+    def predict(self, Xs):
+        lc = np.exp(self.theta[:5])
+        lk = np.exp(self.theta[5])
+        s2 = np.exp(2 * self.theta[6])
+
+        # Cross-kernel
+        Kxs = self.kernel(Xs, self.X, lc, lk, s2)
+
+        # Posterior mean
+        mu = Kxs @ self.alpha
+
+        # Posterior variance
+        v = cho_solve((self.L, True), Kxs.T)
+        var = s2 - np.sum(Kxs * v.T, axis=1)
+
+        # Undo standardisation
+        return mu * self.s + self.m, np.sqrt(np.maximum(var, 1e-12)) * self.s
+
+
+# =============================================================
+# Expected Improvement acquisition function
+# =============================================================
+def expected_improvement(mu, sigma, best, xi):
+    # Standard EI formula with exploration parameter xi
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+
+# =============================================================
+# Bayesian Optimisation Loop
+# =============================================================
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch):
+
+        # Possible categorical values
+        self.celltypes = ['celltype_1','celltype_2','celltype_3']
+
+        # Candidate pool
+        self.pool = X_pool.copy()
+        self.enc_pool = self._encode_batch(self.pool)
+
+        # Observations
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        # Tracking metrics
+        self.batch_best = []
+        self.cum_time = []
+        self.xi_per_batch = []
+
+        # Initialise GP
+        self.gp = GP()
+        self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
+
+        start = time.time()
+
+        # -------- Main BO loop --------
+        for batch_num in range(iters):
+            fake_X, fake_Y = [], []
+
+            # Adaptive exploration parameter xi
+            min_xi, max_xi = 0.01, 0.2
+            y_min, y_max = min(self.Y), max(self.Y)
+
+            if y_max == y_min:
+                xi = max_xi
+            else:
+                xi = max_xi - (max_xi - min_xi) * (y_max - y_min) / (y_max + 1e-9)
+
+            xi = np.clip(xi, min_xi, max_xi)
+            self.xi_per_batch.append(xi)
+
+            # ----- Kriging Believer batch construction -----
+            for _ in range(batch):
+                mu, std = self.gp.predict(self.enc_pool)
+                best = max(self.Y + fake_Y)
+                if batch_num < 3:
+                    mu = mu + 0.5 * std
+                ei = expected_improvement(mu, std, best, xi)
+                # Encourage batch diversity
+                if fake_X:
+                    dist = np.linalg.norm(
+                        self.enc_pool[:, None, :] -
+                        self._encode_batch(fake_X)[None, :, :],
+                        axis=2
+                    ).min(axis=1)
+                    ei *= dist
+
+                # Select next candidate
+                idx = np.argmax(ei)
+                x_new = self.pool.pop(idx)
+                self.enc_pool = np.delete(self.enc_pool, idx, axis=0)
+
+                fake_X.append(x_new)
+
+                # Believed observation
+                mu_fake, _ = self.gp.predict(self._encode_batch([x_new]))
+                fake_Y.append(mu_fake[0])
+
+                # Refit GP with fake data
+                self.gp.fit(
+                    self._encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y)
+                )
+
+            # Evaluate real experiments
+            Y_real = objective_func(fake_X)
+
+            self.batch_best.append(float(np.max(Y_real)))
+            self.cum_time.append(time.time() - start)
+
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+
+            self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
+
+    # ---------------------------------------------------------
+    # Encoding utilities
+    # ---------------------------------------------------------
+    def _encode_point(self, x):
+        t,pH,f1,f2,f3,ct = x
+
+        # Normalised continuous inputs
+        cont = [(t-30)/10,(pH-6)/2,f1/50,f2/50,f3/50]
+
+        # One-hot categorical encoding
+        cat = [1 if ct==c else 0 for c in self.celltypes]
+
+        return np.array(cont + cat)
+
+    def _encode_batch(self, X):
+        return np.vstack([self._encode_point(x) for x in X])
+
+
+# =============================================================
+# Sobol initialisation and candidate pool
+# =============================================================
+bounds = np.array([[30,40],[6,8],[0,50],[0,50],[0,50]])
+celltypes = ['celltype_1','celltype_2','celltype_3']
+
+def make_init(n=6):
+    X=[]
+    for i in range(n):
+        u,_=i4_sobol(5,i)
+        c=bounds[:,0]+u*(bounds[:,1]-bounds[:,0])
+        X.append([*c,celltypes[i%3]])
+    return X
+
+def make_pool(n=8000):
+    X=[]
+    for i in range(n):
+        u,_=i4_sobol(5,i+100)
+        c=bounds[:,0]+u*(bounds[:,1]-bounds[:,0])
+        X.append([*c,random.choice(celltypes)])
+    return X
+
+
+# =============================================================
+# Run optimisation
+# =============================================================
+iters = 15
+batch = 5
+X_pool = make_pool()
+
+bo = BO(make_init(), X_pool, iters, batch)
+
+
+# =============================================================
+# Summary and plots
+# =============================================================
+print("\n=== FINAL SUMMARY ===")
+print("\nBest titre per batch:")
+for i, val in enumerate(bo.batch_best, start=1):
+    print(f"Batch {i:02d}: {val:.3f}")
+print(f"Best BO titre: {max(bo.Y):.3f}")
+print(f"Total runtime: {bo.cum_time[-1]:.2f} s")
+print(f"Xi per batch:  {np.round(bo.xi_per_batch, 3)}")
+
+# -------- Plots --------
+b = np.arange(1, iters + 1)
+
+plt.figure()
+plt.plot(b, bo.batch_best, marker='o')
+plt.xlabel("Batch")
+plt.ylabel("Best Titre")
+plt.title("Best Titre per Batch")
+plt.grid()
+plt.show()
+
+plt.figure()
+plt.plot(b, np.cumsum(bo.batch_best))
+plt.xlabel("Batch")
+plt.ylabel("Cumulative Best Titre")
+plt.title("Cumulative Best Titre")
+plt.grid()
+plt.show()
+
+plt.figure()
+plt.plot(b, bo.cum_time)
+plt.xlabel("Batch")
+plt.ylabel("Cumulative Runtime (s)")
+plt.title("Cumulative Runtime per Batch")
+plt.grid()
+plt.show()
