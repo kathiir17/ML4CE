@@ -1,0 +1,266 @@
+# =============================================================
+# MLCE_Group_BO_VirtualLab_Improved.py
+# Strategy: GP + EI + Kriging Believer + ML-II
+# =============================================================
+
+import sys, os, random, time
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+# -------------------------------------------------------------
+# Import virtual lab
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+# -------------------------------------------------------------
+# Objective function
+# -------------------------------------------------------------
+def objective_func(X):
+    return np.array(
+        virtual_lab.conduct_experiment(X)
+    )
+
+
+# -------------------------------------------------------------
+# Gaussian Process
+# -------------------------------------------------------------
+class GP:
+    def __init__(self):
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5]/lc, A[:, 5:]/lk
+        B1, B2 = B[:, :5]/lc, B[:, 5:]/lk
+
+        sq = np.sum(A1**2,1)[:,None] + np.sum(B1**2,1)[None,:] - 2*A1@B1.T
+        sq += np.sum(A2**2,1)[:,None] + np.sum(B2**2,1)[None,:] - 2*A2@B2.T
+        sq = np.maximum(sq,0)
+
+        d = np.sqrt(sq)
+        sd = np.sqrt(5)*d
+        return s2*(1 + sd + 5*d*d/3) * np.exp(-sd)
+
+    def neg_log_mll(self, theta):
+        lc, lk, ls, ln = theta
+        K = self.kernel(self.X, self.X,
+                        np.exp(lc), np.exp(lk), np.exp(2*ls))
+
+        jitter = 1e-8 + 1e-6*np.var(self.y)
+        K[np.diag_indices(len(self.X))] += np.exp(2*ln) + jitter
+
+        L,_ = cho_factor(K, lower=True)
+        alpha = cho_solve((L,True), self.y)
+
+        return (
+            0.5*self.y@alpha
+            + np.sum(np.log(np.diag(L)))
+            + 0.5*len(self.y)*np.log(2*np.pi)
+        )
+
+    def fit(self, X, y):
+        self.X = X
+        self.m = np.mean(y)
+        self.s = np.std(y) if np.std(y) > 1e-9 else 1.0
+        self.y = (y - self.m)/self.s
+
+        res = minimize(self.neg_log_mll, self.theta, method="L-BFGS-B")
+        self.theta = res.x
+
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X,X,np.exp(lc),np.exp(lk),np.exp(2*ls))
+        jitter = 1e-8 + 1e-6*np.var(self.y)
+        K[np.diag_indices(len(X))] += np.exp(2*ln) + jitter
+
+        self.L,_ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L,True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls,_ = self.theta
+        Kxs = self.kernel(Xs, self.X,
+                          np.exp(lc), np.exp(lk), np.exp(2*ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L,True), Kxs.T)
+        var = np.exp(2*ls) - np.sum(Kxs * v.T, axis=1)
+        return mu*self.s + self.m, np.sqrt(np.maximum(var,1e-12))*self.s
+
+
+# -------------------------------------------------------------
+# Expected Improvement
+# -------------------------------------------------------------
+def expected_improvement(mu, sigma, best, xi=0.01):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+
+# -------------------------------------------------------------
+# Random baseline (COURSEWORK TEMPLATE)
+# -------------------------------------------------------------
+class RandomSelection:
+    def __init__(self, X_searchspace, objective_func, batch, iters):
+        self.batch_best = []
+        self.cum_time = []
+
+        start = time.time()
+        for _ in range(iters):
+            X = random.sample(X_searchspace, batch)
+            Y = objective_func(X)
+            self.batch_best.append(float(np.max(Y)))
+            self.cum_time.append(time.time() - start)
+
+
+# -------------------------------------------------------------
+# Bayesian Optimisation
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch):
+
+        self.celltypes = ['celltype_1','celltype_2','celltype_3']
+        self.pool = X_pool
+        self.enc_pool = self._encode_batch(X_pool)
+        self.taken = np.zeros(len(X_pool), bool)
+
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        self.batch_best = []
+        self.cum_time = []
+
+        self.gp = GP()
+        self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
+
+        start = time.time()
+
+        # Enumerate iterations to track batch number
+        for batch_num in range(1, iters + 1):
+            fake_X, fake_Y = [], []
+
+            for _ in range(batch):
+                mu, std = self.gp.predict(self.enc_pool)
+                best = max(self.Y + fake_Y)
+
+                # Dynamic xi for EI: explore first 2 batches, exploit thereafter
+                if batch_num <= 2:
+                    xi_val = 0.1   # exploratory
+                else:
+                    xi_val = 0.01  # greedy exploitation
+
+                ei = expected_improvement(mu, std, best, xi=xi_val)
+                ei[self.taken] = -np.inf
+
+                idx = np.argmax(ei)
+                x_new = self.pool[idx]
+                fake_X.append(x_new)
+
+                mu_fake,_ = self.gp.predict(self._encode_batch([x_new]))
+                fake_Y.append(mu_fake[0])
+
+                # Kriging Believer: add predicted Y to GP
+                self.gp.fit(
+                    self._encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y)
+                )
+
+            # Evaluate batch
+            Y_real = objective_func(fake_X)
+            self.batch_best.append(float(np.max(Y_real)))
+            self.cum_time.append(time.time() - start)
+
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+            self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
+
+    def _encode_point(self, x):
+        t,pH,f1,f2,f3,ct = x
+        cont = [(t-30)/10, (pH-6)/2, f1/50, f2/50, f3/50]
+        cat = [1 if ct==c else 0 for c in self.celltypes]
+        return np.array(cont + cat)
+
+    def _encode_batch(self, X):
+        return np.vstack([self._encode_point(x) for x in X])
+
+
+# -------------------------------------------------------------
+# Sobol initialisation
+# -------------------------------------------------------------
+bounds = np.array([[30,40],[6,8],[0,50],[0,50],[0,50]])
+celltypes = ['celltype_1','celltype_2','celltype_3']
+
+def make_init(n=6):
+    X=[]
+    for i in range(n):
+        u,_=i4_sobol(5,i)
+        c=bounds[:,0]+u*(bounds[:,1]-bounds[:,0])
+        X.append([*c,celltypes[i%3]])
+    return X
+
+def make_pool(n=3000):
+    X=[]
+    for i in range(n):
+        u,_=i4_sobol(5,i+100)
+        c=bounds[:,0]+u*(bounds[:,1]-bounds[:,0])
+        X.append([*c,random.choice(celltypes)])
+    return X
+
+
+# -------------------------------------------------------------
+# Run BO and Random baseline
+# -------------------------------------------------------------
+iters = 15
+batch = 5
+X_pool = make_pool()
+
+bo = BO(make_init(), X_pool, iters, batch)
+rand = RandomSelection(X_pool, objective_func, batch, iters)
+
+
+# -------------------------------------------------------------
+# Plots
+# -------------------------------------------------------------
+b = np.arange(1, iters+1)
+
+# Best per batch
+plt.plot(b, bo.batch_best, marker='o', label="BO")
+plt.plot(b, rand.batch_best, marker='x', linestyle='--', label="Random")
+plt.xlabel("Batch")
+plt.ylabel("Best Titre")
+plt.title("Best Titre per Batch")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Cumulative best
+plt.plot(b, np.cumsum(bo.batch_best), label="BO")
+plt.plot(b, np.cumsum(rand.batch_best), linestyle='--', label="Random")
+plt.xlabel("Batch")
+plt.ylabel("Cumulative Best Titre")
+plt.title("Cumulative Best Titre")
+plt.legend()
+plt.grid()
+plt.show()
+
+# Cumulative runtime
+plt.plot(b, bo.cum_time, label="BO")
+plt.plot(b, rand.cum_time, linestyle='--', label="Random")
+plt.xlabel("Batch")
+plt.ylabel("Cumulative Runtime (s)")
+plt.title("Cumulative Runtime per Batch")
+plt.legend()
+plt.grid()
+plt.show()
+
+
+# -------------------------------------------------------------
+# Summary
+# -------------------------------------------------------------
+print("\n=== FINAL SUMMARY ===")
+print(f"BO best titre:     {max(bo.batch_best):.3f}")
+print(f"Random best titre: {max(rand.batch_best):.3f}")
+print(f"BO wins by:        {max(bo.batch_best)-max(rand.batch_best):.3f}")
