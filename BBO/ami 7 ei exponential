@@ -24,8 +24,9 @@ import MLCE_CWBO2025.virtual_lab as virtual_lab
 # Objective function
 # -------------------------------------------------------------
 def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
     return np.array(
-        virtual_lab.conduct_experiment(X)
+        virtual_lab.conduct_experiment(X, initial_conditions=custom_init)
     )
 
 
@@ -119,11 +120,9 @@ class RandomSelection:
 # -------------------------------------------------------------
 # Bayesian Optimisation
 # -------------------------------------------------------------
-# -------------------------------------------------------------
-# BO class with adaptive xi based on titre
-# -------------------------------------------------------------
 class BO:
     def __init__(self, X_init, X_pool, iters, batch):
+
         self.celltypes = ['celltype_1','celltype_2','celltype_3']
         self.pool = X_pool
         self.enc_pool = self._encode_batch(X_pool)
@@ -134,6 +133,7 @@ class BO:
 
         self.batch_best = []
         self.cum_time = []
+        self.xi_values = []  # store xi per batch
 
         self.gp = GP()
         self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
@@ -143,12 +143,15 @@ class BO:
         for batch_num in range(1, iters+1):
             fake_X, fake_Y = [], []
 
+            # Compute adaptive xi once per batch
+            best_so_far = max(self.Y)
+            # Scale best titre by a typical max expected value (~10 or 50)
+            xi_val = np.clip(0.2 * np.exp(-0.05 * best_so_far/10), 0.01, 0.3)
+
+            self.xi_values.append(xi_val)
+
             for _ in range(batch):
                 mu, std = self.gp.predict(self.enc_pool)
-                best_so_far = max(self.Y + fake_Y)
-
-                # Adaptive xi based on current best titre
-                xi_val = 0.1 * np.exp(-0.05 * best_so_far)
 
                 ei = expected_improvement(mu, std, best_so_far, xi=xi_val)
                 ei[self.taken] = -np.inf
@@ -160,13 +163,11 @@ class BO:
                 mu_fake,_ = self.gp.predict(self._encode_batch([x_new]))
                 fake_Y.append(mu_fake[0])
 
-                # Kriging Believer: add predicted Y to GP
                 self.gp.fit(
                     self._encode_batch(self.X_obs + fake_X),
                     np.array(self.Y + fake_Y)
                 )
 
-            # Evaluate batch
             Y_real = objective_func(fake_X)
             self.batch_best.append(float(np.max(Y_real)))
             self.cum_time.append(time.time() - start)
@@ -175,14 +176,15 @@ class BO:
             self.Y.extend(Y_real.tolist())
             self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y))
 
-    def _encode_point(self, x):
-        t,pH,f1,f2,f3,ct = x
-        cont = [(t-30)/10, (pH-6)/2, f1/50, f2/50, f3/50]
-        cat = [1 if ct==c else 0 for c in self.celltypes]
-        return np.array(cont + cat)
+    def _encode_point(self,x):
+        t,pH,f1,f2,f3,ct=x
+        cont=[(t-30)/10,(pH-6)/2,f1/50,f2/50,f3/50]
+        cat=[1 if ct==c else 0 for c in self.celltypes]
+        return np.array(cont+cat)
 
-    def _encode_batch(self, X):
+    def _encode_batch(self,X):
         return np.vstack([self._encode_point(x) for x in X])
+
 
 # -------------------------------------------------------------
 # Sobol initialisation
@@ -258,6 +260,17 @@ plt.show()
 # Summary
 # -------------------------------------------------------------
 print("\n=== FINAL SUMMARY ===")
-print(f"BO best titre:     {max(bo.batch_best):.3f}")
+print(f"Total BO runtime: {bo.cum_time[-1]:.2f} seconds")
+
+print("\nBest BO value per batch:")
+for i, val in enumerate(bo.batch_best, start=1):
+    print(f"Batch {i}: {val:.3f}")
+
+print("\nXi value used for each batch:")
+for i, xi in enumerate(bo.xi_values, start=1):
+    print(f"Batch {i}: {xi:.4f}")
+
+print(f"\nOverall BO best titre: {max(bo.batch_best):.3f}")
 print(f"Random best titre: {max(rand.batch_best):.3f}")
-print(f"BO wins by:        {max(bo.batch_best)-max(rand.batch_best):.3f}")
+print(f"BO wins by: {max(bo.batch_best)-max(rand.batch_best):.3f}")
+
