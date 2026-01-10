@@ -1,0 +1,230 @@
+# RL.py
+# Runner script mirroring ML4CE_RL_INV_CW.ipynb workflow:
+# 1) Environment definition
+# 2) Train SA + plots
+# 3) Train REINFORCE (baseline) + plots
+# 4) Train your algorithm + plots
+# 5) Evaluate on test demand dataset + reward distribution plot
+
+import os
+import sys
+import pickle
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+# ---------------------------------------------------------------------
+# Ensure imports work when running RL.py from the project root folder
+# ---------------------------------------------------------------------
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from ML4CE_RL_environment import MESCEnv  # :contentReference[oaicite:3]{index=3}
+from utils import plot_reward_evolution, plot_reward_distribution  # :contentReference[oaicite:4]{index=4}
+from common import PolicyNetwork, evaluate_policy  # :contentReference[oaicite:5]{index=5}
+
+from algorithms.reinforce import REINFORCE_alg
+from algorithms.simulated_annealing import simulated_annealing_alg
+from algorithms.heuristic_policy import HeuristicPolicy
+from algorithms.your_algorithm import your_optimization_alg
+
+
+def set_all_seeds(seed: int = 0) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def build_env() -> MESCEnv:
+    # Same environment definition as the notebook
+    n_retailers = 2
+    n_DCs = 1
+    n_suppliers = 1
+    supply_chain_structure = [[n_retailers], [n_DCs], n_suppliers]
+    time_horizon = 4 * 7  # 28 days
+
+    env = MESCEnv(supply_chain_structure, num_periods=time_horizon)
+    return env
+
+
+def train_sa(env: MESCEnv, seed: int = 0):
+    set_all_seeds(seed)
+
+    hyperparamSA = {}
+    # Problem specs
+    hyperparamSA["param_min"] = -1.0
+    hyperparamSA["param_max"] = 1.0
+    hyperparamSA["num_episodes_avg"] = 5
+    # Algorithm-specific hyperparameters
+    hyperparamSA["initial_temp"] = 1e7
+    hyperparamSA["max_episodes"] = 5000
+    # Execution control
+    hyperparamSA["max_time"] = 60 * 5  # seconds
+
+    policy_SA = PolicyNetwork(
+        input_size=env.observation_space.shape[0],
+        output_size=env.action_space.shape[0],
+    )
+
+    policySA_param, plot_info = simulated_annealing_alg(env, policy_SA, **hyperparamSA)
+
+    # --- Plots (same as notebook) ---
+    plot_reward_evolution(
+        plot_info["episodes"],
+        plot_info["reward_history"],
+        reward_std=plot_info.get("std_history", None),
+    )
+
+    # Plot historical best reward
+    plt.figure()
+    plt.plot(plot_info["episodes"], plot_info["best_reward_history"])
+    plt.xlabel("Episodes")
+    plt.ylabel("Historical best reward")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    return policySA_param, plot_info
+
+
+def train_reinforce(env: MESCEnv, seed: int = 0):
+    set_all_seeds(seed)
+
+    hyperparamRL = {}
+    hyperparamRL["max_episodes"] = 5000
+
+    policy_RL = PolicyNetwork(
+        input_size=env.observation_space.shape[0],
+        output_size=env.action_space.shape[0],
+    )
+
+    policyRL_param, plot_info = REINFORCE_alg(env, policy_RL, **hyperparamRL)
+
+    # --- Plot (same as notebook) ---
+    plot_reward_evolution(plot_info["episodes"], plot_info["reward_history"])
+    plt.tight_layout()
+    plt.show()
+
+    return policyRL_param, plot_info
+
+
+def train_your_algorithm(env: MESCEnv, seed: int = 0):
+    set_all_seeds(seed)
+
+    # Hyperparams as in the notebook section for "your algorithm"
+    hyperparam = {}
+    hyperparam["max_episodes"] = 5000
+    hyperparam["max_time"] = 60 * 5  # seconds
+
+    policy_net = PolicyNetwork(
+        input_size=env.observation_space.shape[0],
+        output_size=env.action_space.shape[0],
+    )
+
+    policy_param, plot_info = your_optimization_alg(env, policy_net, **hyperparam)
+
+    # --- Plot (same as notebook) ---
+    plot_reward_evolution(plot_info["episodes"], plot_info["reward_history"])
+    plt.tight_layout()
+    plt.show()
+
+    return policy_param, plot_info
+
+
+def load_test_dataset():
+    path = os.path.join(PROJECT_ROOT, "benchmarking", "test_demand_dataset.pickle")
+    with open(path, "rb") as f:
+        test_demand_dataset = pickle.load(f)
+    return test_demand_dataset
+
+
+def evaluate_all(env: MESCEnv, your_policy_state_dict: dict):
+    # Mirror notebook evaluation cells:
+    # - Evaluate "Your algorithm"
+    # - Evaluate pretrained SA and pretrained REINFORCE_with_baseline
+    # - Evaluate heuristic (s,S)
+    # - Plot reward distribution comparison
+
+    test_demand_dataset = load_test_dataset()
+
+    policy = PolicyNetwork(
+        input_size=env.observation_space.shape[0],
+        output_size=env.action_space.shape[0],
+    )
+
+    results = {}
+
+    # --- Your algorithm ---
+    policy.load_state_dict(your_policy_state_dict)
+    results["Your algorithm"] = evaluate_policy(policy, env, test_demand_dataset)
+    print(
+        "Performance of your optimization algorithm:"
+        f"\n - Average reward: {np.mean(results['Your algorithm']):.2E}"
+        f"\n - Reward standard deviation: {np.std(results['Your algorithm']):.2E}"
+    )
+
+    # --- Benchmark pretrained policies ---
+    for alg in ["SA", "REINFORCE_with_baseline"]:
+        path = os.path.join(PROJECT_ROOT, "benchmarking", f"policy_{alg}.pt")
+        policy.load_state_dict(torch.load(path, map_location="cpu"))
+        results[alg] = evaluate_policy(policy, env, test_demand_dataset)
+        print(
+            f"{alg} performance:"
+            f"\n - Average reward: {np.mean(results[alg]):.2E}"
+            f"\n - Reward standard deviation: {np.std(results[alg]):.2E}"
+        )
+
+    # --- Heuristic (s,S) policy ---
+    sSpolicy = HeuristicPolicy()
+    # Same parameters as notebook example
+    sSpolicy.policy_param = np.array([11.0, 30.0, 20.0, 34.0, 61.0, 76.0])
+    results["sS"] = sSpolicy.evaluate_policy(env, test_demand_dataset)
+    print(
+        "(s,S) policy performance:"
+        f"\n - Average reward: {np.mean(results['sS']):.2E}"
+        f"\n - Reward standard deviation: {np.std(results['sS']):.2E}"
+    )
+
+    # --- Reward distribution plot ---
+    # Stack into [n_datasets, n_algs] as done in notebook
+    rewards_matrix = np.vstack([results[k] for k in results.keys()]).T
+    plot_reward_distribution(rewards_matrix, labels=list(results.keys()))
+    plt.tight_layout()
+    plt.show()
+
+    return results
+
+
+def main():
+    # You can change this seed; notebook-style usage generally runs multiple seeds in grading.
+    seed = 0
+
+    env = build_env()
+
+    # 1) Train SA + plots
+    print("\n====================")
+    print("Training: Simulated Annealing (SA)")
+    print("====================")
+    _sa_state, _sa_plot = train_sa(env, seed=seed)
+
+    # 2) Train REINFORCE + plots
+    print("\n====================")
+    print("Training: REINFORCE with baseline")
+    print("====================")
+    _rl_state, _rl_plot = train_reinforce(env, seed=seed)
+
+    # 3) Train YOUR algorithm + plots
+    print("\n====================")
+    print("Training: Your optimization algorithm")
+    print("====================")
+    your_state, _your_plot = train_your_algorithm(env, seed=seed)
+
+    # 4) Evaluation on test dataset + distribution plot
+    print("\n====================")
+    print("Evaluation on test demand dataset")
+    print("====================")
+    _results = evaluate_all(env, your_state)
+
+
+if __name__ == "__main__":
+    main()
