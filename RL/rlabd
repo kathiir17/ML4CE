@@ -1,0 +1,169 @@
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.distributions import Normal
+
+from common import PolicyNetwork
+from utils import setup_logging
+
+
+def your_optimization_alg(
+    env,
+    max_episodes=5000,
+    gamma=0.99,
+    learning_rate=1e-3,
+    seed=0,
+):
+    """
+    Reinforcement Learning algorithm for inventory management
+    using REINFORCE with baseline.
+
+    Returns
+    -------
+    policy_weights : dict
+        State dict of the trained neural network
+    logs : dict
+        Dictionary with learning curves for plotting
+    """
+
+    # ==============================
+    # Reproducibility
+    # ==============================
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    state_dim = env.n_states
+    action_dim = env.n_actions
+
+    # ==============================
+    # Policy Network (DO NOT MODIFY)
+    # ==============================
+    policy_net = PolicyNetwork(state_dim, action_dim)
+    optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
+
+    # Fixed exploration noise
+    action_std = torch.ones(action_dim)
+
+    # ==============================
+    # Logging
+    # ==============================
+    log_file = setup_logging("REINFORCE")
+    episode_rewards = []
+
+    # Checkpoints for reporting
+    checkpoint_rewards = []
+
+    checkpoint_episodes = [
+        0,
+        max_episodes // 2,
+        max_episodes - 1,
+    ]
+
+    # ==============================
+    # TRAINING LOOP
+    # ==============================
+    for episode in range(max_episodes):
+        log_probs = []
+        rewards = []
+
+        env.reset()
+        state = env.state
+        done = False
+        total_reward = 0.0
+
+        while not done:
+            state_tensor = torch.FloatTensor(state)
+
+            # Policy outputs mean action
+            action_mean = policy_net(state_tensor)
+
+            # Gaussian policy
+            dist = Normal(action_mean, action_std)
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum()
+
+            # Clip actions to environment bounds
+            action_np = torch.clamp(
+                action,
+                min=torch.tensor(0.0),
+                max=torch.tensor(env.action_space_UB, dtype=torch.float32),
+            ).detach().numpy().astype(np.int16)
+
+            next_state, reward, done, _ = env.step(action_np)
+
+            log_probs.append(log_prob)
+            rewards.append(reward)
+
+            state = next_state
+            total_reward += reward
+
+        episode_rewards.append(total_reward)
+
+        # ==============================
+        # REINFORCE UPDATE (WITH BASELINE)
+        # ==============================
+        returns = []
+        G = 0.0
+        for r in reversed(rewards):
+            G = r + gamma * G
+            returns.insert(0, G)
+
+        returns = torch.tensor(returns, dtype=torch.float32)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+        loss = 0.0
+        for log_prob, Gt in zip(log_probs, returns):
+            loss += -log_prob * Gt
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # ==============================
+        # Save checkpoints
+        # ==============================
+        if episode in checkpoint_episodes:
+            checkpoint_rewards.append(total_reward)
+
+        # ==============================
+        # Logging
+        # ==============================
+        with open(log_file, "a") as f:
+            f.write(f"{episode},{total_reward}\n")
+
+        if episode % 100 == 0:
+            print(f"Episode {episode} | Total reward: {total_reward:.2f}")
+
+    # ==============================
+    # TRAINING SUMMARY OUTPUT
+    # ==============================
+    checkpoint_rewards = np.array(checkpoint_rewards, dtype=np.float32)
+    best_so_far = np.maximum.accumulate(checkpoint_rewards)
+    final_best_reward = best_so_far[-1]
+
+    np.set_printoptions(precision=2, suppress=True)
+
+    print("\n=== TRAINING RESULTS ===")
+    print("Reward checkpoints:", checkpoint_rewards)
+    print("Best-so-far:", best_so_far)
+    print(f"FINAL BEST REWARD: {final_best_reward}")
+
+    # ==============================
+    # REQUIRED OUTPUT FORMAT
+    # ==============================
+    policy_weights = policy_net.state_dict()
+
+    logs = {
+        "episodes": list(range(len(episode_rewards))),
+        "rewards": episode_rewards,
+    }
+
+    return policy_weights, logs
+
+
+# ==============================
+# REQUIRED METADATA (EDIT THESE)
+# ==============================
+team_names = ["YOUR NAME", "TEAMMATE NAME"]
+cids = ["YOUR CID", "TEAMMATE CID"]
+question = [1, 0]  # 1 = YES, 0 = NO
