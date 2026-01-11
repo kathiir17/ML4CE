@@ -1,0 +1,315 @@
+# =============================================================
+# MLCE_Group_BO_VirtualLab_Improved.py
+# Strategy: GP + EI + Kriging Believer + ML-II
+# Added:
+#   A) Warm-up threshold before any ML-II re-optimisation
+#   B) Tighter hyperparameter bounds (log-space)
+#   C) UCB boost only for first K picks of batch 1 (not whole early phase)
+#   D) Sobol stride + small offset (avoids huge-index freeze, adds diversity)
+# =============================================================
+
+import sys, os, random, time
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+# -------------------------------------------------------------
+# Import virtual lab
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+# -------------------------------------------------------------
+# Objective function
+# -------------------------------------------------------------
+def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(
+        virtual_lab.conduct_experiment(X, initial_conditions=custom_init)
+    )
+
+
+# -------------------------------------------------------------
+# Gaussian Process
+# -------------------------------------------------------------
+class GP:
+    def __init__(self):
+        # theta = [log(lc), log(lk), log(ls), log(ln)]
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+
+        # TIGHTER optimisation bounds (log-space)
+        # lc, lk around encoded inputs ~[0,1] => keep within reasonable range
+        # ln kept reasonably small to avoid "everything is noise" fits
+        self._bounds = [
+            (-3.0, 2.0),    # log(lc)
+            (-3.0, 2.0),    # log(lk)
+            (-3.0, 3.0),    # log(ls)
+            (-15.0, -1.0),  # log(ln)
+        ]
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5]/lc, A[:, 5:]/lk
+        B1, B2 = B[:, :5]/lc, B[:, 5:]/lk
+
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2*A1@B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2*A2@B2.T
+        sq = np.maximum(sq, 0)
+
+        d = np.sqrt(sq)
+        sd = np.sqrt(5) * d
+        return s2 * (1 + sd + 5*d*d/3) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2*ls))
+        jitter = 1e-8 + 1e-6*np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2*ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = (
+                0.5*self.y@alpha
+                + np.sum(np.log(np.diag(L)))
+                + 0.5*len(self.y)*np.log(2*np.pi)
+            )
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def fit(self, X, y, optimise=True):
+        self.X = X
+
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            res = minimize(
+                self.neg_log_mll,
+                self.theta,
+                method="L-BFGS-B",
+                bounds=self._bounds
+            )
+            self.theta = res.x
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2*ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2*ls) - np.sum(Kxs * v.T, axis=1)
+        return mu*self.s + self.m, np.sqrt(np.maximum(var, 1e-12))*self.s
+
+
+# -------------------------------------------------------------
+# Expected Improvement
+# -------------------------------------------------------------
+def expected_improvement(mu, sigma, best, xi=0.01):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+
+# -------------------------------------------------------------
+# Bayesian Optimisation
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch):
+
+        # --------- knobs (minimal, safe) ----------
+        self.N_MIN_OPT = 15          # A) warm-up threshold for ML-II
+        self.UCB_KAPPA = 1.0         # C) UCB strength
+        self.UCB_PICKS = 2           # C) only first 2 picks of batch 1
+        self.DIV_WEIGHT = 0.3        # keep gentle
+        # -----------------------------------------
+
+        self.celltypes = ['celltype_1', 'celltype_2', 'celltype_3']
+        self.pool = X_pool
+        self.enc_pool = self._encode_batch(X_pool)
+        self.taken = np.zeros(len(X_pool), bool)
+
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        self.batch_best = []
+        self.cum_time = []
+        self.xi_values = []
+
+        self.gp = GP()
+
+        # initial real fit:
+        # with only ~6 points, ML-II is often unstable -> start with optimise=False
+        self.gp.fit(
+            self._encode_batch(self.X_obs),
+            np.array(self.Y, dtype=float),
+            optimise=False
+        )
+
+        start = time.time()
+
+        for batch_num in range(1, iters + 1):
+            fake_X, fake_Y = [], []
+
+            best_real = float(np.max(self.Y))
+            xi_val = float(np.clip(0.2 * np.exp(-0.05 * best_real / 10.0), 0.01, 0.3))
+            self.xi_values.append(xi_val)
+
+            for pick_idx in range(batch):
+                mu, std = self.gp.predict(self.enc_pool)
+                best = float(np.max(self.Y + fake_Y))
+
+                # C) UCB only for the first 2 picks of batch 1
+                if (batch_num == 1) and (pick_idx < self.UCB_PICKS):
+                    mu_eff = mu + self.UCB_KAPPA * std
+                else:
+                    mu_eff = mu
+
+                ei = expected_improvement(mu_eff, std, best, xi=xi_val)
+
+                # diversity penalty within current batch
+                if len(fake_X) > 0:
+                    enc_fake = self._encode_batch(fake_X)
+                    diff = self.enc_pool[:, None, :] - enc_fake[None, :, :]
+                    dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                    ei = ei * (1.0 + self.DIV_WEIGHT * dist)
+
+                ei[self.taken] = -np.inf
+                idx = int(np.argmax(ei))
+
+                self.taken[idx] = True
+                x_new = self.pool[idx]
+                fake_X.append(x_new)
+
+                mu_fake, _ = self.gp.predict(self._encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                # batch construction: update posterior only, no ML-II
+                self.gp.fit(
+                    self._encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            # evaluate batch for real
+            Y_real = objective_func(fake_X)
+            self.batch_best.append(float(np.max(Y_real)))
+            self.cum_time.append(time.time() - start)
+
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+
+            # A) warm-up threshold:
+            # only start ML-II once we have enough REAL points
+            optimise_now = (len(self.Y) >= self.N_MIN_OPT)
+            self.gp.fit(
+                self._encode_batch(self.X_obs),
+                np.array(self.Y, dtype=float),
+                optimise=optimise_now
+            )
+
+    def _encode_point(self, x):
+        t, pH, f1, f2, f3, ct = x
+        cont = [(t-30)/10, (pH-6)/2, f1/50, f2/50, f3/50]
+        cat = [1 if ct == c else 0 for c in self.celltypes]
+        return np.array(cont + cat)
+
+    def _encode_batch(self, X):
+        return np.vstack([self._encode_point(x) for x in X])
+
+
+# -------------------------------------------------------------
+# Sobol initialisation and balanced pool
+# -------------------------------------------------------------
+bounds = np.array([[30, 40], [6, 8], [0, 50], [0, 50], [0, 50]])
+celltypes = ["celltype_1", "celltype_2", "celltype_3"]
+
+def make_init_with_offset(n=6, sobol_offset=0, sobol_stride=1):
+    X = []
+    for i in range(n):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * i)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[i % 3]])
+    return X
+
+def make_pool_balanced(n_total=3000, sobol_offset=100, sobol_stride=1):
+    """
+    D) Balanced candidate pool + Sobol stride:
+       indices = offset + stride * (ct_idx*per + j)
+    """
+    per = n_total // 3
+    X = []
+
+    for ct_idx, ct in enumerate(celltypes):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+            X.append([*c, ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        idx = 3 * per + r
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[r % 3]])
+
+    return X
+
+
+# -------------------------------------------------------------
+# Run BO 15 times (MARK-SCHEME CORRECT CUMSUM)
+# -------------------------------------------------------------
+iters = 15
+batch = 5
+N_RUNS = 15
+
+bo_best_runs = []
+bo_cum_runs = []
+
+for run_idx in range(N_RUNS):
+    # keep indices small to avoid sobol_seq huge-index slowdown
+    base = random.randint(0, 50_000)
+
+    # D) stride randomisation (odd strides mix bits better; keep small)
+    stride_pool = random.choice([1, 3, 5, 7, 9])
+    stride_init = random.choice([1, 3, 5, 7, 9])
+
+    init_offset  = base
+    pool_offset  = base + 10_000
+
+    X_pool = make_pool_balanced(n_total=3000, sobol_offset=pool_offset, sobol_stride=stride_pool)
+    X_init = make_init_with_offset(n=6, sobol_offset=init_offset, sobol_stride=stride_init)
+
+    bo = BO(X_init, X_pool, iters, batch)
+
+    bb = np.array(bo.batch_best, dtype=float)
+    bo_best = float(bb.max())
+    bo_cum = float(np.maximum.accumulate(bb).sum())
+
+    bo_best_runs.append(bo_best)
+    bo_cum_runs.append(bo_cum)
+
+    print(f"Run {run_idx+1:02d}/{N_RUNS} | BO best={bo_best:.3f} cum@15={bo_cum:.3f}")
+
+bo_best_runs = np.array(bo_best_runs, dtype=float)
+bo_cum_runs = np.array(bo_cum_runs, dtype=float)
+
+print("\n=== 15-RUN SUMMARY ===")
+print(f"BO avg best titre:     {bo_best_runs.mean():.3f} (std {bo_best_runs.std(ddof=1):.3f})")
+print(f"BO avg cum titre @15:  {bo_cum_runs.mean():.3f} (std {bo_cum_runs.std(ddof=1):.3f})")
