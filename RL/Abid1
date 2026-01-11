@@ -1,0 +1,134 @@
+import copy
+import time
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from common import PolicyNetwork
+from ML4CE_RL_environment import MESCEnv
+from utils import setup_model_saving
+
+
+def your_optimization_alg(
+    env: MESCEnv,
+    policy_net: PolicyNetwork,
+    *,
+    max_episodes=2000,
+    max_time=5 * 60,  # seconds
+):
+    # Create file to store model weights
+    save_f_path = setup_model_saving(algorithm="Your algorithm")
+
+    # Buffers for plotting
+    plot_data = {"reward_history": [], "episodes": []}
+
+    # Book-keeping
+    start_time = time.time()
+    best_reward = -np.inf
+    best_policy = copy.deepcopy(policy_net.state_dict())
+
+    # -----------------------------------------------------------------------------------
+    # PLEASE DO NOT MODIFY THE CODE ABOVE THIS LINE
+    # -----------------------------------------------------------------------------------
+
+    # =========================
+    # Hyperparameters
+    # =========================
+    learning_rate = 5e-4          # tuned LR (lower than default REINFORCE)
+    gamma = 0.99                  # discount factor
+    baseline_momentum = 0.9       # moving-average baseline
+    init_action_std = 6.0         # strong exploration
+    min_action_std = 1.5          # keep exploration alive
+    std_decay = 0.9995            # very slow decay
+
+    optimizer = torch.optim.Adam(policy_net.parameters(), lr=learning_rate)
+    action_std = torch.ones(env.n_actions) * init_action_std
+    baseline = 0.0
+
+    # =========================
+    # Training loop
+    # =========================
+    for episode in tqdm(range(int(max_episodes)), desc="Episode loop"):
+
+        env.reset()
+        state = env.state
+        done = False
+
+        log_probs = []
+        rewards = []
+
+        # -------- Rollout one episode --------
+        while not done:
+            state_t = torch.FloatTensor(state)
+
+            # Mean action from policy network
+            action_mean = policy_net(state_t)
+
+            # Gaussian exploration
+            dist = torch.distributions.Normal(action_mean, action_std)
+            action = dist.sample()
+            log_prob = dist.log_prob(action).sum()
+
+            # Environment expects integer actions
+            action_np = np.clip(
+                np.round(action.detach().numpy()),
+                env.action_space.low,
+                env.action_space.high,
+            ).astype(np.int16)
+
+            next_state, reward, done, _ = env.step(action_np)
+
+            log_probs.append(log_prob)
+            rewards.append(reward)
+            state = next_state
+
+        # -------- Compute discounted returns --------
+        G = 0.0
+        returns = []
+        for r in reversed(rewards):
+            G = r + gamma * G
+            returns.insert(0, G)
+
+        returns = torch.tensor(returns, dtype=torch.float32)
+        episode_return = returns[0].item()
+
+        # -------- Baseline & advantages --------
+        baseline = baseline_momentum * baseline + (1 - baseline_momentum) * episode_return
+        advantages = returns - baseline
+
+        # -------- Policy gradient update --------
+        loss = -torch.sum(torch.stack(log_probs) * advantages)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # -------- Exploration decay --------
+        action_std = torch.clamp(action_std * std_decay, min=min_action_std)
+
+        # -------- Logging --------
+        plot_data["episodes"].append(episode)
+        plot_data["reward_history"].append(episode_return)
+
+        if episode_return > best_reward:
+            best_reward = episode_return
+            best_policy = copy.deepcopy(policy_net.state_dict())
+            torch.save(best_policy, save_f_path)
+
+        # -----------------------------------------------------------------------------------
+        # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
+        # -----------------------------------------------------------------------------------
+        if (time.time() - start_time) > max_time:
+            break
+
+    print(f"Policy model weights saved in: {save_f_path}")
+    print(f"Best reward: {best_reward}")
+
+    team_names = [
+        "Del Rio Chanona, Antonio",
+        "Fons, Isabela",
+    ]
+    cids = ["16879875", "06069513"]
+    question = [1, 0]
+
+    return best_policy, plot_data
