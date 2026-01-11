@@ -1,0 +1,501 @@
+# =============================================================
+# XI MICRO-SWEEP HARNESS (NO objective changes)
+# Goal:
+#   - Sweep 12 xi-parameter configs (15 runs each)
+#   - Same visuals: boxplot(best), boxplot(cumsum), mean running-best curves
+#   - Rank by joint score, print TOP 5
+#   - Re-run TOP 3 configs with 30 runs each
+#
+# IMPORTANT (per your instruction):
+#   - objective_func is EXACTLY the same as your always-working BO code
+#   - NO guarded objective, NO is_obviously_bad, NO timeout threads
+#   - The ONLY change vs the single-policy script is:
+#       * xi_schedule is parameterised (A, B, floor, cap)
+#       * sweep harness around it
+# =============================================================
+
+import sys, os, random, time
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+# -------------------------------------------------------------
+# Import virtual lab
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+# -------------------------------------------------------------
+# Objective function (UNCHANGED)
+# -------------------------------------------------------------
+def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(
+        virtual_lab.conduct_experiment(X, initial_conditions=custom_init)
+    )
+
+# -------------------------------------------------------------
+# Gaussian Process (robust ML-II)
+# -------------------------------------------------------------
+class GP:
+    def __init__(self, n_restarts=3, restart_scale=0.35, seed=None):
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+
+        self._bounds = [
+            (-3.0, 2.0),
+            (-3.0, 2.0),
+            (-3.0, 3.0),
+            (-15.0, -1.0),
+        ]
+
+        self.n_restarts = int(n_restarts)
+        self.restart_scale = float(restart_scale)
+        self.rng = np.random.default_rng(seed)
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5]/lc, A[:, 5:]/lk
+        B1, B2 = B[:, :5]/lc, B[:, 5:]/lk
+
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2*A1@B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2*A2@B2.T
+        sq = np.maximum(sq, 0)
+
+        d = np.sqrt(sq)
+        sd = np.sqrt(5) * d
+        return s2 * (1 + sd + 5*d*d/3) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2*ls))
+
+        jitter = 1e-8 + 1e-6*np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2*ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = (
+                0.5*self.y@alpha
+                + np.sum(np.log(np.diag(L)))
+                + 0.5*len(self.y)*np.log(2*np.pi)
+            )
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def _clip_to_bounds(self, theta):
+        out = np.array(theta, dtype=float).copy()
+        for i, (lo, hi) in enumerate(self._bounds):
+            out[i] = float(np.clip(out[i], lo, hi))
+        return out
+
+    def _optimise_theta_multistart(self):
+        starts = [self.theta.copy()]
+        for _ in range(self.n_restarts):
+            th0 = self.theta + self.rng.normal(0.0, self.restart_scale, size=self.theta.shape)
+            starts.append(self._clip_to_bounds(th0))
+
+        best_nll = 1e30
+        best_theta = self.theta.copy()
+
+        for th0 in starts:
+            try:
+                res = minimize(
+                    self.neg_log_mll,
+                    th0,
+                    method="L-BFGS-B",
+                    bounds=self._bounds
+                )
+                th = res.x
+                nll = float(res.fun) if np.isfinite(res.fun) else 1e25
+            except Exception:
+                th = th0
+                nll = 1e25
+
+            if nll < best_nll:
+                best_nll = nll
+                best_theta = th
+
+        self.theta = best_theta
+
+    def fit(self, X, y, optimise=True):
+        self.X = X
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            self._optimise_theta_multistart()
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2*ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2*ls) - np.sum(Kxs * v.T, axis=1)
+        return mu*self.s + self.m, np.sqrt(np.maximum(var, 1e-12))*self.s
+
+# -------------------------------------------------------------
+# Acquisition: EI
+# -------------------------------------------------------------
+def expected_improvement(mu, sigma, best, xi=0.01):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+# -------------------------------------------------------------
+# Parameterised xi schedule
+# xi(best) = clip(A * exp(-B * best/10), floor, cap)
+# -------------------------------------------------------------
+def xi_schedule(best_real, A, B, floor, cap=0.30):
+    return float(np.clip(A * np.exp(-B * best_real / 10.0), floor, cap))
+
+# -------------------------------------------------------------
+# Bayesian Optimisation (same as working code; xi is parameterised)
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch,
+                 xi_A=0.24, xi_B=0.05, xi_floor=0.03, xi_cap=0.30):
+
+        self.N_MIN_OPT = 15
+        self.UCB_KAPPA = 1.0
+        self.UCB_PICKS = 2
+        self.DIV_WEIGHT = 0.30
+        self.DIV_WEIGHT_B1 = 0.50
+        self.TIE_TOPK = 5
+        self.TIE_BATCHES = 1
+
+        self.xi_A = float(xi_A)
+        self.xi_B = float(xi_B)
+        self.xi_floor = float(xi_floor)
+        self.xi_cap = float(xi_cap)
+
+        self.celltypes = ['celltype_1', 'celltype_2', 'celltype_3']
+        self.pool = X_pool
+        self.enc_pool = self._encode_batch(X_pool)
+        self.taken = np.zeros(len(X_pool), bool)
+
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))  # UNCHANGED CALL
+
+        self.batch_best = []
+        self.xi_values = []
+
+        self.gp = GP(n_restarts=3, restart_scale=0.35)
+
+        self.gp.fit(
+            self._encode_batch(self.X_obs),
+            np.array(self.Y, dtype=float),
+            optimise=False
+        )
+
+        for batch_num in range(1, iters + 1):
+            fake_X, fake_Y = [], []
+
+            best_real = float(np.max(self.Y))
+            xi_val = xi_schedule(best_real, self.xi_A, self.xi_B, self.xi_floor, cap=self.xi_cap)
+            self.xi_values.append(xi_val)
+
+            div_w = self.DIV_WEIGHT_B1 if batch_num == 1 else self.DIV_WEIGHT
+
+            for pick_idx in range(batch):
+                mu, std = self.gp.predict(self.enc_pool)
+                best_ref = float(np.max(self.Y + fake_Y))
+
+                if (batch_num == 1) and (pick_idx < self.UCB_PICKS):
+                    mu_eff = mu + self.UCB_KAPPA * std
+                else:
+                    mu_eff = mu
+
+                score = expected_improvement(mu_eff, std, best_ref, xi=xi_val)
+
+                if len(fake_X) > 0:
+                    enc_fake = self._encode_batch(fake_X)
+                    diff = self.enc_pool[:, None, :] - enc_fake[None, :, :]
+                    dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                    score = score * (1.0 + div_w * dist)
+
+                score[self.taken] = -np.inf
+
+                if batch_num <= self.TIE_BATCHES:
+                    finite = np.isfinite(score)
+                    if np.any(finite):
+                        k = min(self.TIE_TOPK, int(np.sum(finite)))
+                        cand = np.argpartition(score, -k)[-k:]
+                        idx = int(np.random.choice(cand))
+                    else:
+                        idx = int(np.argmax(score))
+                else:
+                    idx = int(np.argmax(score))
+
+                self.taken[idx] = True
+                x_new = self.pool[idx]
+                fake_X.append(x_new)
+
+                mu_fake, _ = self.gp.predict(self._encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                self.gp.fit(
+                    self._encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            Y_real = objective_func(fake_X)  # UNCHANGED CALL
+            self.batch_best.append(float(np.max(Y_real)))
+
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+
+            optimise_now = (len(self.Y) >= self.N_MIN_OPT)
+            self.gp.fit(
+                self._encode_batch(self.X_obs),
+                np.array(self.Y, dtype=float),
+                optimise=optimise_now
+            )
+
+    def _encode_point(self, x):
+        t, pH, f1, f2, f3, ct = x
+        cont = [(t-30)/10, (pH-6)/2, f1/50, f2/50, f3/50]
+        cat = [1 if ct == c else 0 for c in self.celltypes]
+        return np.array(cont + cat)
+
+    def _encode_batch(self, X):
+        return np.vstack([self._encode_point(x) for x in X])
+
+# -------------------------------------------------------------
+# Sobol initialisation and balanced pool
+# -------------------------------------------------------------
+bounds = np.array([[30, 40], [6, 8], [0, 50], [0, 50], [0, 50]])
+celltypes = ["celltype_1", "celltype_2", "celltype_3"]
+
+def make_init_with_offset(n=6, sobol_offset=0, sobol_stride=1):
+    X = []
+    for i in range(n):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * i)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[i % 3]])
+    return X
+
+def make_pool_balanced(n_total=3000, sobol_offset=100, sobol_stride=1):
+    per = n_total // 3
+    X = []
+    for ct_idx, ct in enumerate(celltypes):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+            X.append([*c, ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        idx = 3 * per + r
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[r % 3]])
+
+    return X
+
+# =============================================================
+# SWEEP SETUP
+# =============================================================
+ITERS = 15
+BATCH = 5
+N_RUNS = 15
+N_CONFIRM = 30
+
+A_LIST = [0.22, 0.24, 0.26]
+B_LIST = [0.04, 0.05]
+F_LIST = [0.02, 0.03]
+XI_CAP = 0.30
+
+configs = []
+for A in A_LIST:
+    for B in B_LIST:
+        for f in F_LIST:
+            configs.append(dict(xi_A=A, xi_B=B, xi_floor=f, xi_cap=XI_CAP))
+
+def cfg_name(cfg):
+    return f"xi(A={cfg['xi_A']:.2f},B={cfg['xi_B']:.2f},floor={cfg['xi_floor']:.2f},cap={cfg['xi_cap']:.2f})"
+
+# =============================================================
+# RUN SWEEP
+# =============================================================
+def run_config(cfg, n_runs):
+    best_runs = []
+    cum_runs = []
+    curves = []
+
+    for run_idx in range(n_runs):
+        base = random.randint(0, 50_000)
+        stride_pool = random.choice([1, 3, 5, 7, 9])
+        stride_init = random.choice([1, 3, 5, 7, 9])
+
+        X_pool = make_pool_balanced(n_total=3000, sobol_offset=base + 10_000, sobol_stride=stride_pool)
+        X_init = make_init_with_offset(n=6, sobol_offset=base, sobol_stride=stride_init)
+
+        bo = BO(
+            X_init, X_pool, ITERS, BATCH,
+            xi_A=cfg["xi_A"], xi_B=cfg["xi_B"],
+            xi_floor=cfg["xi_floor"], xi_cap=cfg["xi_cap"],
+        )
+
+        bb = np.array(bo.batch_best, dtype=float)
+        rb = np.maximum.accumulate(bb)
+
+        best_runs.append(float(bb.max()))
+        cum_runs.append(float(rb.sum()))
+        curves.append(rb)
+
+        print(f"  run {run_idx+1:02d}/{n_runs} | best={best_runs[-1]:.2f} cum={cum_runs[-1]:.0f}")
+
+    return (np.array(best_runs, dtype=float),
+            np.array(cum_runs, dtype=float),
+            np.array(curves, dtype=float))
+
+results = {}
+t0 = time.time()
+
+print(f"Running {len(configs)} xi configs x {N_RUNS} runs each...")
+
+for i, cfg in enumerate(configs, start=1):
+    name = cfg_name(cfg)
+    print(f"\n=== XI CONFIG {i:02d}/{len(configs)}: {name} ===")
+    best_runs, cum_runs, curves = run_config(cfg, N_RUNS)
+
+    results[name] = dict(
+        cfg=cfg,
+        best_runs=best_runs,
+        cum_runs=cum_runs,
+        curve_mean=curves.mean(axis=0),
+        curve_std=curves.std(axis=0, ddof=1) if len(curves) > 1 else np.zeros(ITERS),
+    )
+
+    print(f"  avg best: {best_runs.mean():.3f} (std {best_runs.std(ddof=1):.3f})")
+    print(f"  avg cum : {cum_runs.mean():.3f} (std {cum_runs.std(ddof=1):.3f})")
+    print(f"  P(best<200)={np.mean(best_runs<200.0):.2f} | P(cum<2500)={np.mean(cum_runs<2500.0):.2f}")
+
+print(f"\nTOTAL XI SWEEP TIME: {time.time() - t0:.1f}s")
+
+# =============================================================
+# RANKING + TOP 5
+# =============================================================
+names = list(results.keys())
+
+best_meds = np.array([np.median(results[n]["best_runs"]) for n in names], dtype=float)
+cum_meds  = np.array([np.median(results[n]["cum_runs"])  for n in names], dtype=float)
+
+best_ref = float(np.median(best_meds))
+cum_ref  = float(np.median(cum_meds))
+
+rank_rows = []
+for n in names:
+    br = results[n]["best_runs"]
+    cr = results[n]["cum_runs"]
+
+    med_best = float(np.median(br))
+    med_cum  = float(np.median(cr))
+
+    p_bad = float(np.mean(br < 200.0) + np.mean(cr < 2500.0))
+
+    score = (0.5 * (med_best / (best_ref + 1e-9)) +
+             0.5 * (med_cum  / (cum_ref  + 1e-9)) -
+             0.60 * p_bad)
+
+    rank_rows.append((score, n, med_best, med_cum,
+                      float(np.mean(br<200.0)), float(np.mean(cr<2500.0))))
+
+rank_rows.sort(reverse=True, key=lambda x: x[0])
+
+print("\n=== TOP 5 XI CONFIGS (joint score, collapse-penalised) ===")
+for i, (score, n, mb, mc, p1, p2) in enumerate(rank_rows[:5], start=1):
+    print(f"{i:02d}. score={score:.3f} | med_best={mb:.1f} med_cum={mc:.0f} | "
+          f"P(best<200)={p1:.2f} P(cum<2500)={p2:.2f} | {n}")
+
+# =============================================================
+# VISUALISATION
+# =============================================================
+best_data = [results[n]["best_runs"] for n in names]
+cum_data  = [results[n]["cum_runs"]  for n in names]
+
+plt.figure()
+plt.boxplot(best_data, labels=range(1, len(names)+1), showfliers=False)
+plt.xlabel("XI config index")
+plt.ylabel("BO best titre (per run)")
+plt.title(f"Best titre distribution ({N_RUNS} runs per xi config)")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.boxplot(cum_data, labels=range(1, len(names)+1), showfliers=False)
+plt.xlabel("XI config index")
+plt.ylabel("Cumulative running-best sum (15 batches)")
+plt.title(f"Cumsum distribution ({N_RUNS} runs per xi config)")
+plt.grid(True)
+plt.show()
+
+b = np.arange(1, ITERS+1)
+plt.figure()
+for i, n in enumerate(names, start=1):
+    plt.plot(b, results[n]["curve_mean"], label=f"{i}")
+plt.xlabel("Batch")
+plt.ylabel("Mean running-best titre")
+plt.title("Mean running-best per batch (label = xi config index)")
+plt.grid(True)
+plt.legend(title="XI cfg", ncol=2, fontsize=7)
+plt.show()
+
+print("\n=== XI CONFIG INDEX MAP ===")
+for i, n in enumerate(names, start=1):
+    print(f"{i}: {n}")
+
+# =============================================================
+# CONFIRMATION: re-run TOP 3 with 30 runs each
+# =============================================================
+top3 = rank_rows[:3]
+confirm = {}
+
+print(f"\nRe-running TOP 3 with {N_CONFIRM} runs each for confirmation...")
+
+t1 = time.time()
+for j, (_, name, _, _, _, _) in enumerate(top3, start=1):
+    cfg = results[name]["cfg"]
+    print(f"\n=== CONFIRM {j}/3: {name} ===")
+    best_runs, cum_runs, curves = run_config(cfg, N_CONFIRM)
+
+    confirm[name] = dict(
+        cfg=cfg,
+        best_runs=best_runs,
+        cum_runs=cum_runs,
+        curve_mean=curves.mean(axis=0),
+        curve_std=curves.std(axis=0, ddof=1) if len(curves) > 1 else np.zeros(ITERS),
+    )
+
+    print(f"  avg best: {best_runs.mean():.3f} (std {best_runs.std(ddof=1):.3f})")
+    print(f"  avg cum : {cum_runs.mean():.3f} (std {cum_runs.std(ddof=1):.3f})")
+    print(f"  med best: {np.median(best_runs):.3f} | med cum: {np.median(cum_runs):.3f}")
+    print(f"  P(best<200)={np.mean(best_runs<200.0):.2f} | P(cum<2500)={np.mean(cum_runs<2500.0):.2f}")
+
+print(f"\nTOTAL CONFIRM TIME: {time.time() - t1:.1f}s")
+
+print("\n=== FINAL CONFIRM SUMMARY (TOP 3) ===")
+for name in confirm:
+    br = confirm[name]["best_runs"]
+    cr = confirm[name]["cum_runs"]
+    print(f"{name}")
+    print(f"  avg best {br.mean():.1f} (std {br.std(ddof=1):.1f}) | med {np.median(br):.1f} | P(best<200)={np.mean(br<200):.2f}")
+    print(f"  avg cum  {cr.mean():.0f} (std {cr.std(ddof=1):.0f}) | med {np.median(cr):.0f} | P(cum<2500)={np.mean(cr<2500):.2f}")
