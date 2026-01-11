@@ -1,0 +1,485 @@
+# =============================================================
+# MLCE_90min_Sweep_Full.py
+#
+# FULL single-file script (includes imports + objective + GP + Sobol + sweep)
+# Runs ~30 configs x 30 runs each (target ~90 min depending on machine)
+#
+# Optimises BOTH:
+#   1) max titre per run
+#   2) mark-scheme cumulative running-best sum over 15 batches
+#
+# Visuals:
+#   - boxplots(best), boxplots(cumsum)
+#   - mean running-best curves
+# Ranking:
+#   - joint score using medians + collapse penalties
+# =============================================================
+
+import sys, os, random, time
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+# -------------------------------------------------------------
+# Import virtual lab
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+# -------------------------------------------------------------
+# Objective function
+# -------------------------------------------------------------
+def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(
+        virtual_lab.conduct_experiment(X, initial_conditions=custom_init)
+    )
+
+
+# -------------------------------------------------------------
+# Gaussian Process
+# -------------------------------------------------------------
+class GP:
+    def __init__(self):
+        # theta = [log(lc), log(lk), log(ls), log(ln)]
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+
+        # tighter bounds (your latest)
+        self._bounds = [
+            (-3.0, 2.0),    # log(lc)
+            (-3.0, 2.0),    # log(lk)
+            (-3.0, 3.0),    # log(ls)
+            (-15.0, -1.0),  # log(ln)
+        ]
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5] / lc, A[:, 5:] / lk
+        B1, B2 = B[:, :5] / lc, B[:, 5:] / lk
+
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2 * A1 @ B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2 * A2 @ B2.T
+        sq = np.maximum(sq, 0.0)
+
+        d = np.sqrt(sq)
+        sd = np.sqrt(5.0) * d
+        return s2 * (1.0 + sd + 5.0 * d * d / 3.0) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2.0 * ls))
+        jitter = 1e-8 + 1e-6 * np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2.0 * ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = (
+                0.5 * self.y @ alpha
+                + np.sum(np.log(np.diag(L)))
+                + 0.5 * len(self.y) * np.log(2.0 * np.pi)
+            )
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def fit(self, X, y, optimise=True):
+        self.X = X
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            res = minimize(
+                self.neg_log_mll,
+                self.theta,
+                method="L-BFGS-B",
+                bounds=self._bounds
+            )
+            self.theta = res.x
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2.0 * ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2.0 * ls) - np.sum(Kxs * v.T, axis=1)
+        return mu * self.s + self.m, np.sqrt(np.maximum(var, 1e-12)) * self.s
+
+
+# -------------------------------------------------------------
+# Acquisition
+# -------------------------------------------------------------
+def expected_improvement(mu, sigma, best, xi=0.01):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+# XI schedule family (around base)
+def xi_schedule(best_real, mode):
+    # base (your current)
+    if mode == "xi_base":
+        return float(np.clip(0.20 * np.exp(-0.05 * best_real / 10.0), 0.01, 0.30))
+
+    # more exploration late (floor up)
+    if mode == "xi_floor_03":
+        return float(np.clip(0.20 * np.exp(-0.05 * best_real / 10.0), 0.03, 0.30))
+
+    # less decay (keeps xi higher longer)
+    if mode == "xi_decay_003":
+        return float(np.clip(0.20 * np.exp(-0.03 * best_real / 10.0), 0.01, 0.30))
+
+    # slightly stronger early exploration but same cap
+    if mode == "xi_a024":
+        return float(np.clip(0.24 * np.exp(-0.05 * best_real / 10.0), 0.01, 0.30))
+
+    raise ValueError(f"Unknown xi mode: {mode}")
+
+# Acquisition family (EI_only vs EI_mu_boost)
+def apply_acq_variant(mu, std, batch_num, pick_idx, acq_mode, kappa=1.0, ucb_picks=2):
+    """
+    Returns (mu_for_EI, score_override or None).
+    If score_override is not None -> use it directly for argmax.
+    """
+    if acq_mode == "EI_only":
+        return mu, None
+
+    if acq_mode == "EI_mu_boost":
+        if (batch_num == 1) and (pick_idx < ucb_picks):
+            return mu + kappa * std, None
+        return mu, None
+
+    raise ValueError(f"Unknown acquisition mode: {acq_mode}")
+
+
+# -------------------------------------------------------------
+# BO
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch,
+                 xi_mode="xi_base",
+                 acq_mode="EI_mu_boost",
+                 n_min_opt=15,
+                 div_weight=0.3,
+                 kappa=1.0,
+                 ucb_picks=2):
+
+        self.N_MIN_OPT = int(n_min_opt)
+        self.DIV_WEIGHT = float(div_weight)
+        self.KAPPA = float(kappa)
+        self.UCB_PICKS = int(ucb_picks)
+
+        self.xi_mode = xi_mode
+        self.acq_mode = acq_mode
+
+        self.celltypes = ['celltype_1', 'celltype_2', 'celltype_3']
+        self.pool = X_pool
+        self.enc_pool = self._encode_batch(X_pool)
+        self.taken = np.zeros(len(X_pool), dtype=bool)
+
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        self.batch_best = []
+        self.xi_values = []
+
+        self.gp = GP()
+        # warm start: no ML-II on tiny data
+        self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y, dtype=float), optimise=False)
+
+        for batch_num in range(1, iters + 1):
+            fake_X, fake_Y = [], []
+
+            best_real = float(np.max(self.Y))
+            xi_val = xi_schedule(best_real, self.xi_mode)
+            self.xi_values.append(xi_val)
+
+            for pick_idx in range(batch):
+                mu, std = self.gp.predict(self.enc_pool)
+                best_ref = float(np.max(self.Y + fake_Y))
+
+                mu_for_ei, score_override = apply_acq_variant(
+                    mu, std, batch_num, pick_idx,
+                    self.acq_mode,
+                    kappa=self.KAPPA,
+                    ucb_picks=self.UCB_PICKS
+                )
+
+                # Only EI-based modes in this sweep
+                score = expected_improvement(mu_for_ei, std, best_ref, xi=xi_val)
+
+                # diversity penalty within current batch (gentle)
+                if len(fake_X) > 0:
+                    enc_fake = self._encode_batch(fake_X)
+                    diff = self.enc_pool[:, None, :] - enc_fake[None, :, :]
+                    dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                    score = score * (1.0 + self.DIV_WEIGHT * dist)
+
+                score[self.taken] = -np.inf
+                idx = int(np.argmax(score))
+
+                self.taken[idx] = True
+                x_new = self.pool[idx]
+                fake_X.append(x_new)
+
+                # Kriging Believer: hallucinate GP mean, but DO NOT re-optimise theta
+                mu_fake, _ = self.gp.predict(self._encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                self.gp.fit(
+                    self._encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            # evaluate batch for real
+            Y_real = objective_func(fake_X)
+            self.batch_best.append(float(np.max(Y_real)))
+
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+
+            # warm-up threshold before ML-II
+            optimise_now = (len(self.Y) >= self.N_MIN_OPT)
+            self.gp.fit(self._encode_batch(self.X_obs), np.array(self.Y, dtype=float), optimise=optimise_now)
+
+    def _encode_point(self, x):
+        t, pH, f1, f2, f3, ct = x
+        cont = [(t - 30) / 10, (pH - 6) / 2, f1 / 50, f2 / 50, f3 / 50]
+        cat = [1 if ct == c else 0 for c in self.celltypes]
+        return np.array(cont + cat)
+
+    def _encode_batch(self, X):
+        return np.vstack([self._encode_point(x) for x in X])
+
+
+# -------------------------------------------------------------
+# Sobol init and balanced pool (stride + small offsets)
+# -------------------------------------------------------------
+bounds = np.array([[30, 40], [6, 8], [0, 50], [0, 50], [0, 50]], dtype=float)
+celltypes = ["celltype_1", "celltype_2", "celltype_3"]
+
+def make_init_with_offset(n=6, sobol_offset=0, sobol_stride=1):
+    X = []
+    for i in range(n):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * i)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[i % 3]])
+    return X
+
+def make_pool_balanced(n_total=3000, sobol_offset=100, sobol_stride=1):
+    per = n_total // 3
+    X = []
+
+    for ct_idx, ct in enumerate(celltypes):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+            X.append([*c, ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        idx = 3 * per + r
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[r % 3]])
+
+    return X
+
+
+# =============================================================
+# SWEEP HARNESS
+# =============================================================
+ITERS = 15
+BATCH = 5
+N_RUNS = 30
+
+# Config grid (~28 configs after EI_only de-dup)
+XI_LIST = ["xi_base", "xi_floor_03", "xi_decay_003", "xi_a024"]      # 4
+ACQ_LIST = ["EI_only", "EI_mu_boost"]                                 # 2
+KAPPA_LIST = [0.5, 1.0]                                               # 2 (only for EI_mu_boost)
+UCBP_LIST = [1, 2, 3]                                                 # 3
+
+raw = []
+for xi_m in XI_LIST:
+    for acq_m in ACQ_LIST:
+        if acq_m == "EI_only":
+            raw.append((xi_m, acq_m, 0.0, 0))
+        else:
+            for kappa in KAPPA_LIST:
+                for ucbp in UCBP_LIST:
+                    raw.append((xi_m, acq_m, kappa, ucbp))
+
+configs = []
+for xi_m, acq_m, kappa, ucbp in raw:
+    if acq_m == "EI_only":
+        name = f"XI::{xi_m} + ACQ::{acq_m}"
+    else:
+        name = f"XI::{xi_m} + ACQ::{acq_m} + kappa={kappa} + ucb_picks={ucbp}"
+    configs.append({
+        "name": name,
+        "xi_mode": xi_m,
+        "acq_mode": acq_m,
+        "kappa": float(kappa),
+        "ucb_picks": int(ucbp),
+    })
+
+print(f"Total configs: {len(configs)}")
+print(f"Runs per config: {N_RUNS}")
+print("Sweep started...")
+
+COMMON = dict(
+    n_min_opt=15,
+    div_weight=0.3,
+)
+
+results = {}  # name -> dict(best_runs, cum_runs, curve_mean, curve_std)
+
+t0 = time.time()
+
+for cfg_idx, cfg in enumerate(configs, start=1):
+    name = cfg["name"]
+    best_runs, cum_runs, curves = [], [], []
+
+    print(f"\n=== CONFIG {cfg_idx}/{len(configs)}: {name} ===")
+
+    for run_idx in range(N_RUNS):
+        base = random.randint(0, 50_000)
+        stride_pool = random.choice([1, 3, 5, 7, 9])
+        stride_init = random.choice([1, 3, 5, 7, 9])
+
+        X_pool = make_pool_balanced(n_total=3000, sobol_offset=base + 10_000, sobol_stride=stride_pool)
+        X_init = make_init_with_offset(n=6, sobol_offset=base, sobol_stride=stride_init)
+
+        bo = BO(
+            X_init, X_pool, ITERS, BATCH,
+            xi_mode=cfg["xi_mode"],
+            acq_mode=cfg["acq_mode"],
+            kappa=cfg["kappa"],
+            ucb_picks=cfg["ucb_picks"],
+            **COMMON
+        )
+
+        bb = np.array(bo.batch_best, dtype=float)
+        rb = np.maximum.accumulate(bb)
+
+        run_best = float(bb.max())
+        run_cum = float(rb.sum())
+
+        best_runs.append(run_best)
+        cum_runs.append(run_cum)
+        curves.append(rb)
+
+        print(f"  Run {run_idx+1:02d}/{N_RUNS} | best={run_best:.3f} cum@15={run_cum:.3f}")
+
+    best_runs = np.array(best_runs, dtype=float)
+    cum_runs = np.array(cum_runs, dtype=float)
+    curves = np.array(curves, dtype=float)
+
+    results[name] = dict(
+        best_runs=best_runs,
+        cum_runs=cum_runs,
+        curve_mean=curves.mean(axis=0),
+        curve_std=curves.std(axis=0, ddof=1) if N_RUNS > 1 else np.zeros(ITERS),
+    )
+
+    print("  --- SUMMARY ---")
+    print(f"  avg best:   {best_runs.mean():.3f} (std {best_runs.std(ddof=1):.3f})")
+    print(f"  avg cum :   {cum_runs.mean():.3f} (std {cum_runs.std(ddof=1):.3f})")
+    print(f"  med best:   {np.median(best_runs):.3f} | med cum: {np.median(cum_runs):.3f}")
+    print(f"  P(best<200)={np.mean(best_runs<200.0):.2f} | P(cum<2500)={np.mean(cum_runs<2500.0):.2f}")
+
+elapsed = time.time() - t0
+print(f"\nTOTAL SWEEP TIME: {elapsed:.1f}s")
+
+
+# =============================================================
+# JOINT RANKING (medians + collapse penalties)
+# =============================================================
+names = list(results.keys())
+
+best_meds = np.array([np.median(results[n]["best_runs"]) for n in names], dtype=float)
+cum_meds = np.array([np.median(results[n]["cum_runs"]) for n in names], dtype=float)
+
+best_ref = float(np.median(best_meds))
+cum_ref = float(np.median(cum_meds))
+
+rank_rows = []
+for n in names:
+    br = results[n]["best_runs"]
+    cr = results[n]["cum_runs"]
+
+    med_best = float(np.median(br))
+    med_cum = float(np.median(cr))
+
+    p_bad_best = float(np.mean(br < 200.0))
+    p_bad_cum = float(np.mean(cr < 2500.0))
+    p_bad = p_bad_best + p_bad_cum  # 0..2
+
+    score = (
+        0.5 * (med_best / (best_ref + 1e-9))
+        + 0.5 * (med_cum / (cum_ref + 1e-9))
+        - 0.40 * p_bad
+    )
+    rank_rows.append((score, n, med_best, med_cum, p_bad_best, p_bad_cum))
+
+rank_rows.sort(reverse=True, key=lambda x: x[0])
+
+print("\n=== TOP 12 CONFIGS (joint score) ===")
+for i, (score, n, mb, mc, p1, p2) in enumerate(rank_rows[:12], start=1):
+    print(f"{i:02d} score={score:.3f} | med_best={mb:.1f} med_cum={mc:.0f} | P(best<200)={p1:.2f} P(cum<2500)={p2:.2f}")
+    print(f"    {n}")
+
+
+# =============================================================
+# VISUALISATION
+# =============================================================
+names = list(results.keys())
+best_data = [results[n]["best_runs"] for n in names]
+cum_data = [results[n]["cum_runs"] for n in names]
+
+plt.figure()
+plt.boxplot(best_data, labels=list(range(1, len(names) + 1)), showfliers=False)
+plt.xlabel("Config index")
+plt.ylabel("BO best titre (per run)")
+plt.title(f"Best titre distribution ({N_RUNS} runs per config)")
+plt.grid(True)
+plt.show()
+
+plt.figure()
+plt.boxplot(cum_data, labels=list(range(1, len(names) + 1)), showfliers=False)
+plt.xlabel("Config index")
+plt.ylabel("Cumulative running-best sum (15 batches)")
+plt.title(f"Cumsum distribution ({N_RUNS} runs per config)")
+plt.grid(True)
+plt.show()
+
+b = np.arange(1, ITERS + 1)
+plt.figure()
+for i, n in enumerate(names, start=1):
+    plt.plot(b, results[n]["curve_mean"], label=str(i))
+plt.xlabel("Batch")
+plt.ylabel("Mean running-best titre")
+plt.title("Mean running-best per batch (label = config index)")
+plt.grid(True)
+plt.legend(title="Config", ncol=2, fontsize=7)
+plt.show()
+
+print("\n=== CONFIG INDEX MAP ===")
+for i, n in enumerate(names, start=1):
+    print(f"{i}: {n}")
