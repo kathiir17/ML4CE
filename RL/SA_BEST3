@@ -1,0 +1,209 @@
+import copy
+import time
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from common import PolicyNetwork
+from ML4CE_RL_environment import MESCEnv
+from utils import setup_model_saving
+
+
+def your_optimization_alg(
+    env: MESCEnv,
+    policy_net: PolicyNetwork,
+    *,
+    max_episodes=2000,
+    max_time=5 * 60,  # seconds
+):
+    # Create file to store model weights
+    save_f_path = setup_model_saving(algorithm="Your algorithm")
+
+    # Buffers for plotting
+    plot_data = {"reward_history": [], "episodes": []}
+
+    # Book-keeping
+    start_time = time.time()
+    best_reward = -np.inf
+    best_policy = copy.deepcopy(policy_net.state_dict())
+
+    # -----------------------------------------------------------------------------------
+    # PLEASE DO NOT MODIFY THE CODE ABOVE THIS LINE
+    # -----------------------------------------------------------------------------------
+
+    # =========================
+    # Training loop
+    # =========================
+    for episode in tqdm(range(int(max_episodes)), desc="Episode loop"):
+
+            # =========================
+        # Simulated Annealing setup
+        # =========================
+        if episode == 0:
+            T = 1.5
+            T_min = 1e-3
+            alpha = 0.997          # slower cooling (important)
+            noise_std = 0.08       # base noise (we’ll scale it)
+            K_fast = 1             # cheap eval most of the time
+            K_slow = 3             # confirm occasionally
+
+            # escape tools
+            jump_every = 40        # occasional big jump
+            restart_patience = 250 # restart if stuck
+
+
+            # Helper functions (defined once)
+            def get_flat_params(model):
+                return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+            def set_flat_params(model, flat_params):
+                idx = 0
+                for p in model.parameters():
+                    numel = p.numel()
+                    p.data.copy_(flat_params[idx:idx + numel].view_as(p))
+                    idx += numel
+
+            def evaluate_episode(env, policy_net):
+                env.reset()
+                state = env.state
+                done = False
+                total_reward = 0.0
+
+                while not done:
+                    state_t = torch.FloatTensor(state)
+                    action_mean = policy_net(state_t)
+
+                    action_np = np.clip(
+                        np.round(action_mean.detach().numpy()),
+                        env.action_space.low,
+                        env.action_space.high,
+                    ).astype(np.int16)
+
+                    state, reward, done, _ = env.step(action_np)
+                    total_reward += reward
+
+                return total_reward
+            
+            def evaluate_K(env, policy_net, K=3):
+                return float(np.mean([evaluate_episode(env, policy_net) for _ in range(K)]))
+
+
+            # Initial evaluation
+            current_params = get_flat_params(policy_net)
+             # Build mask for last layer (fc3) once
+            mask = torch.zeros_like(current_params)
+            idx = 0
+            for name, p in policy_net.named_parameters():
+                n = p.numel()
+                if "fc3" in name:
+                    mask[idx:idx + n] = 1.0
+                idx += n
+
+            current_reward = evaluate_K(env, policy_net, K=K_slow)
+
+            best_reward = current_reward
+            best_policy = copy.deepcopy(policy_net.state_dict())
+            torch.save(best_policy, save_f_path)
+            
+            no_improve_counter = 0
+
+        # =========================
+        # Propose new parameters
+        # =========================
+        # =========================
+        # Propose new parameters (layerwise + jumps)
+        # =========================
+        flat = current_params.clone()
+
+
+
+        # decide if this is a global jump iteration
+        do_jump = (episode % jump_every == 0)
+
+        # noise scale
+        adaptive_noise = noise_std * max(0.2, T / 1.5)
+
+        if do_jump:
+            # global exploration: perturb all params
+            proposal_params = flat + (2.5 * adaptive_noise) * torch.randn_like(flat)
+        else:
+            # local refinement: perturb only last layer
+            proposal_params = flat + adaptive_noise * torch.randn_like(flat) * mask
+
+        set_flat_params(policy_net, proposal_params)
+
+
+        K_eval = K_slow if (episode % 25 == 0) else K_fast
+        proposal_reward = evaluate_K(env, policy_net, K=K_eval)
+
+
+        delta = proposal_reward - current_reward
+
+        # =========================
+        # Acceptance rule
+        # =========================
+        if delta > 0 or np.random.rand() < np.exp(delta / T):
+            current_params = proposal_params
+            current_reward = proposal_reward
+        else:
+            set_flat_params(policy_net, current_params)
+
+        # =========================
+        # Cooling schedule
+        # =========================
+        T = max(T * alpha, T_min)
+
+        # =========================
+        # Logging & saving
+        # =========================
+        plot_data["episodes"].append(episode)
+        plot_data["reward_history"].append(current_reward)
+
+        if current_reward > best_reward:
+            best_reward = current_reward
+            best_policy = copy.deepcopy(policy_net.state_dict())
+            torch.save(best_policy, save_f_path)
+            no_improve_counter = 0
+        else:
+            no_improve_counter += 1
+        
+                # =========================
+        # Reheating if stuck
+        # =========================
+        if no_improve_counter > 500:
+            T = min(T * 1.5, 1.0)
+            no_improve_counter = 0
+        
+        # =========================
+        # Restart-from-best if stuck (multi-start)
+        # =========================
+        if no_improve_counter > restart_patience:
+            # go back to best known policy and re-explore
+            policy_net.load_state_dict(best_policy)
+            current_params = get_flat_params(policy_net)
+            current_reward = evaluate_K(env, policy_net, K=K_slow)
+
+            T = 1.5                 # reheat fully
+            noise_std = min(0.12, noise_std * 1.2)  # slightly bigger steps
+            no_improve_counter = 0
+
+
+
+
+        # -----------------------------------------------------------------------------------
+        # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
+        # -----------------------------------------------------------------------------------
+        if (time.time() - start_time) > max_time:
+            break
+
+    print(f"Policy model weights saved in: {save_f_path}")
+    print(f"Best reward: {best_reward}")
+
+    team_names = [
+        "Del Rio Chanona, Antonio",
+        "Fons, Isabela",
+    ]
+    cids = ["16879875", "06069513"]
+    question = [1, 0]
+
+    return best_policy, plot_data
