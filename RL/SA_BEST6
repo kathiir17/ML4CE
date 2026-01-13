@@ -78,40 +78,42 @@ def your_optimization_alg(
     base_noise = 0.10
     noise = base_noise
 
-    K_fast = 1
-    K_slow = 5
+
+
 
     stagnation_limit = 300
     jump_every = 25
 
-    current_params = get_flat_params(policy_net)
-    current_reward = evaluate(env, policy_net, K_slow)
 
-    best_reward = current_reward
-    best_policy = copy.deepcopy(policy_net.state_dict())
-    torch.save(best_policy, save_f_path)
 
-    stagnation_counter = 0
-
-    # =========================
-    # Layer-wise mask
-    # =========================
-    flat_dim = current_params.numel()
-    last_layer_mask = torch.zeros(flat_dim)
-
-    idx = 0
-    for name, p in policy_net.named_parameters():
-        n = p.numel()
-        if "fc3" in name:
-            last_layer_mask[idx:idx+n] = 1.0
-        idx += n
 
     # =========================
     # Optimization loop
     # =========================
     for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
-
+        K_slow = min(5, 1 + episode // 300)
+        K_fast = 1
         K_eval = K_fast
+        current_params = get_flat_params(policy_net)
+        current_reward = evaluate(env, policy_net, K_slow)
+        # =========================
+        # Layer-wise mask
+        # =========================
+        flat_dim = current_params.numel()
+        last_layer_mask = torch.zeros(flat_dim)
+
+        idx = 0
+        for name, p in policy_net.named_parameters():
+            n = p.numel()
+            if "fc3" in name:
+                last_layer_mask[idx:idx+n] = 1.0
+            idx += n
+
+        best_reward = current_reward
+        best_policy = copy.deepcopy(policy_net.state_dict())
+        torch.save(best_policy, save_f_path)
+
+        stagnation_counter = 0
         flat = current_params.clone()
 
         # Early exploration: all layers
@@ -185,3 +187,4 @@ def your_optimization_alg(
     question = [1, 0]
 
     return best_policy, plot_data
+
