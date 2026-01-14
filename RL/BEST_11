@@ -1,0 +1,279 @@
+import copy
+import time
+import numpy as np
+import torch
+from tqdm import tqdm
+from collections import deque
+
+from common import PolicyNetwork
+from ML4CE_RL_environment import MESCEnv
+from utils import setup_model_saving
+
+
+def your_optimization_alg(
+    env: MESCEnv,
+    policy_net: PolicyNetwork,
+    *,
+    max_episodes=2000,
+    max_time=5 * 60,  # seconds
+):
+    # Create file to store model weights
+    save_f_path = setup_model_saving(algorithm="Your algorithm")
+
+    # Buffers for plotting
+    plot_data = {"reward_history": [], "episodes": []}
+
+    # Book-keeping
+    start_time = time.time()
+    best_reward = -np.inf
+    best_policy = copy.deepcopy(policy_net.state_dict())
+
+    # -----------------------------------------------------------------------------------
+    # PLEASE DO NOT MODIFY THE CODE ABOVE THIS LINE
+    # -----------------------------------------------------------------------------------
+
+    # =========================
+    # Helper functions
+    # =========================
+    def run_episode(env, policy_net, demand=None):
+        env.demand_dataset = demand
+        env.reset()
+        state = env.state
+        done = False
+        total_reward = 0.0
+
+        while not done:
+            with torch.no_grad():
+                action_mean = policy_net(torch.FloatTensor(state))
+
+            action = np.fix(action_mean.detach().numpy()).astype(np.int16)
+            
+            # Penalty for infeasible actions
+            if np.any(action < env.action_space.low) or np.any(action > env.action_space.high):
+                return -1e9
+
+            state, reward, done, _ = env.step(action)
+            total_reward += reward
+
+        return float(total_reward)
+
+    def evaluate_on_demands(env, policy_net, demands):
+        return np.mean([run_episode(env, policy_net, demand=d) for d in demands])
+
+    def evaluate(env, policy_net, K, demand_pool):
+        idx = np.random.randint(0, len(demand_pool), size=K)
+        batch = [demand_pool[i] for i in idx]
+        return evaluate_on_demands(env, policy_net, batch)
+
+    def get_flat_params(model):
+        return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+    def set_flat_params(model, flat):
+        idx = 0
+        for p in model.parameters():
+            n = p.numel()
+            p.data.copy_(flat[idx:idx+n].view_as(p))
+            idx += n
+
+    # =========================
+    # Simulated Annealing setup
+    # =========================
+    T = 2.0
+    T_min = 5e-4
+    alpha = 0.9988
+    
+    base_noise = 0.10
+    noise = base_noise
+    
+    K_fast = 2          # More stable fast eval
+    K_slow = 7          # More thorough slow eval
+    
+    stagnation_limit = 250
+    jump_every = 30
+    
+    # =========================
+    # Larger, regularly refreshed demand pool for generalization
+    # =========================
+    pool_size = 15      # Larger pool = better generalization
+    demand_pool = []
+    
+    for _ in range(pool_size):
+        dem, _ = env.sample_demands_episode()
+        demand_pool.append(dem)
+    
+    refresh_every = 25  # More frequent refresh
+    refresh_count = 3   # Replace multiple scenarios each time
+    
+    # =========================
+    # Validation set (separate from training)
+    # =========================
+    validation_pool = []
+    for _ in range(10):
+        dem, _ = env.sample_demands_episode()
+        validation_pool.append(dem)
+    
+    current_params = get_flat_params(policy_net)
+    current_reward = evaluate(env, policy_net, K_slow, demand_pool)
+    
+    # Track both training and validation performance
+    best_reward = current_reward
+    best_validation = evaluate(env, policy_net, 10, validation_pool)
+    best_policy = copy.deepcopy(policy_net.state_dict())
+    best_params = current_params.clone()
+    torch.save(best_policy, save_f_path)
+    
+    stagnation_counter = 0
+    recent_rewards = deque(maxlen=50)
+    
+    # =========================
+    # Layer-wise mask
+    # =========================
+    flat_dim = current_params.numel()
+    last_layer_mask = torch.zeros(flat_dim)
+    mid_layer_mask = torch.zeros(flat_dim)
+    
+    idx = 0
+    for name, p in policy_net.named_parameters():
+        n = p.numel()
+        if "fc3" in name:
+            last_layer_mask[idx:idx+n] = 1.0
+        if "fc2" in name or "fc3" in name:
+            mid_layer_mask[idx:idx+n] = 1.0
+        idx += n
+    
+    # =========================
+    # Layer-wise exploration scale
+    # =========================
+    scale = torch.ones(flat_dim)
+    idx = 0
+    for name, p in policy_net.named_parameters():
+        n = p.numel()
+        if "fc3" in name:
+            scale[idx:idx+n] = 1.2
+        elif "fc2" in name:
+            scale[idx:idx+n] = 1.0
+        elif "fc1" in name:
+            scale[idx:idx+n] = 0.8
+        idx += n
+    
+    # =========================
+    # Optimization loop
+    # =========================
+    for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
+        
+        flat = current_params.clone()
+        
+        # Regularly refresh demand pool to prevent overfitting
+        if episode % refresh_every == 0 and episode > 0:
+            for _ in range(refresh_count):
+                j = np.random.randint(0, pool_size)
+                dem, _ = env.sample_demands_episode()
+                demand_pool[j] = dem
+        
+        # Progressive layer focusing with smoother transition
+        progress = episode / max_episodes
+        if progress < 0.4:
+            mask = torch.ones_like(flat)
+        elif progress < 0.7:
+            mask = mid_layer_mask
+        else:
+            mask = last_layer_mask
+        
+        # Lévy-flight global jump
+        if episode % jump_every == 0:
+            step = torch.randn_like(flat) / (torch.rand_like(flat) ** 0.5 + 0.1)
+            proposal = flat + noise * 1.5 * step * scale * mask
+        else:
+            proposal = flat + noise * torch.randn_like(flat) * scale * mask
+        
+        set_flat_params(policy_net, proposal)
+        
+        # Two-stage evaluation
+        candidate_fast = evaluate(env, policy_net, K_fast, demand_pool)
+        
+        if candidate_fast >= current_reward - 300:
+            candidate_reward = evaluate(env, policy_net, K_slow, demand_pool)
+        else:
+            candidate_reward = candidate_fast
+        
+        recent_rewards.append(candidate_reward)
+        
+        # Adaptive acceptance using recent performance
+        if len(recent_rewards) >= 20:
+            threshold = np.percentile(recent_rewards, 55)
+        else:
+            threshold = current_reward
+        
+        delta = candidate_reward - threshold
+        
+        # Accept or reject
+        if delta > 0 or np.random.rand() < np.exp(delta / T):
+            current_params = proposal
+            current_reward = candidate_reward
+        else:
+            set_flat_params(policy_net, current_params)
+        
+        # =========================
+        # Adaptive mechanisms with validation check
+        # =========================
+        if current_reward > best_reward + 50:  # Significant improvement threshold
+            # Validate on separate dataset
+            validation_score = evaluate(env, policy_net, 10, validation_pool)
+            
+            # Only accept if validation also improves (prevents overfitting)
+            if validation_score > best_validation * 0.98:  # Allow 2% tolerance
+                best_reward = current_reward
+                best_validation = validation_score
+                best_policy = copy.deepcopy(policy_net.state_dict())
+                best_params = current_params.clone()
+                torch.save(best_policy, save_f_path)
+                stagnation_counter = 0
+                noise *= 0.96
+        else:
+            stagnation_counter += 1
+            if stagnation_counter % 20 == 0:
+                noise *= 1.02
+        
+        noise = np.clip(noise, 0.02, 0.30)
+        T = max(T * alpha, T_min)
+        
+        # Reheat if stuck
+        if stagnation_counter > stagnation_limit:
+            T = 1.8
+            noise = base_noise * 1.2
+            stagnation_counter = 0
+            
+            # Restart from best with small perturbation
+            current_params = best_params.clone() + 0.05 * torch.randn_like(best_params)
+            set_flat_params(policy_net, current_params)
+            current_reward = evaluate(env, policy_net, K_slow, demand_pool)
+        
+        # Periodic validation check to monitor generalization
+        if episode % 100 == 0 and episode > 0:
+            val_score = evaluate(env, policy_net, 10, validation_pool)
+            if val_score > best_validation:
+                best_validation = val_score
+                best_policy = copy.deepcopy(policy_net.state_dict())
+                best_params = current_params.clone()
+                torch.save(best_policy, save_f_path)
+        
+        plot_data["episodes"].append(episode)
+        plot_data["reward_history"].append(best_reward)
+
+        # -----------------------------------------------------------------------------------
+        # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
+        # -----------------------------------------------------------------------------------
+        if (time.time() - start_time) > max_time:
+            break
+
+    print(f"Policy model weights saved in: {save_f_path}")
+    print(f"Best reward: {best_reward}")
+
+    team_names = [
+        "Del Rio Chanona, Antonio",
+        "Fons, Isabela",
+    ]
+    cids = ["16879875", "06069513"]
+    question = [1, 0]
+
+    return best_policy, plot_data
