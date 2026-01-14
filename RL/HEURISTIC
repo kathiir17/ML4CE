@@ -1,0 +1,163 @@
+        # =========================
+        # Heuristic (s,S) optimizer + distillation into PolicyNetwork
+        # =========================
+
+        # ---- one-time init (episode 0) ----
+        if episode == 0:
+            rng = np.random.default_rng(42)
+
+            n_actions = env.action_space.shape[0]
+            # action upper-bounds (order quantity limits)
+            a_ub = env.action_space.high.astype(np.float32)
+
+            # inventory-position upper bounds for each entity (retailers + DCs)
+            # env.state = [inv_pos(rets)..., inv_pos(DCs)..., dow]
+            s_ub = env.observation_space.high[:n_actions].astype(np.float32)
+
+            # (s,S) parameters packed as [s0,S0,s1,S1,...]
+            theta_dim = 2 * n_actions
+
+            # initialize around a sensible point: s ~ 1/3 of limit, S ~ 2/3 of inv_pos_ub
+            theta_mean = np.zeros(theta_dim, dtype=np.float32)
+            theta_mean[0::2] = 0.33 * s_ub
+            theta_mean[1::2] = 0.66 * s_ub
+
+            # exploration scale (diagonal std)
+            theta_std = np.zeros(theta_dim, dtype=np.float32)
+            theta_std[0::2] = 0.20 * s_ub + 1.0
+            theta_std[1::2] = 0.20 * s_ub + 1.0
+
+            # CEM/ES settings
+            pop_size = 10
+            elite_frac = 0.3
+            n_elite = max(2, int(pop_size * elite_frac))
+
+            # how many noisy rollouts per candidate (tradeoff speed vs noise)
+            eval_runs = 2
+
+            # buffers for one generation
+            gen_thetas = []
+            gen_scores = []
+
+            # best policy in (s,S) space
+            best_theta = theta_mean.copy()
+
+            # distillation optimizer
+            distill_lr = 1e-3
+            distill_steps = 60  # small & fast; called only occasionally
+
+            # helper: build action from (s,S)
+            def ss_action(theta, state_vec):
+                # state_vec includes DOW at the end; we ignore it
+                inv_pos = state_vec[:n_actions].astype(np.float32)
+                s = theta[0::2]
+                S = theta[1::2]
+
+                # order if inv_pos <= s, up to min(S - inv_pos, limit)
+                order = np.where(inv_pos <= s, np.clip(S - inv_pos, 0.0, a_ub), 0.0)
+                return np.floor(order).astype(np.int16)
+
+            # helper: evaluate candidate theta with a few rollouts
+            def eval_theta(theta):
+                total = 0.0
+                for _ in range(eval_runs):
+                    env.reset()
+                    done = False
+                    ep_ret = 0.0
+                    while not done:
+                        act = ss_action(theta, env.state)
+                        _, r, done, _ = env.step(act)
+                        ep_ret += float(r)
+                    total += ep_ret
+                return total / eval_runs
+
+            # helper: distill current best (s,S) into the NN
+            def distill_into_nn(theta_to_copy):
+                # collect a small dataset of visited states from heuristic rollouts
+                states = []
+                targets = []
+                n_collect_eps = 3
+                for _ in range(n_collect_eps):
+                    env.reset()
+                    done = False
+                    while not done:
+                        s_now = env.state.copy()
+                        a_now = ss_action(theta_to_copy, s_now)
+                        states.append(s_now.astype(np.float32))
+                        targets.append(a_now.astype(np.float32))
+                        _, _, done, _ = env.step(a_now)
+
+                X = torch.tensor(np.array(states), dtype=torch.float32)
+                Y = torch.tensor(np.array(targets), dtype=torch.float32)
+
+                opt = torch.optim.Adam(policy_net.parameters(), lr=distill_lr)
+                loss_fn = torch.nn.MSELoss()
+
+                policy_net.train()
+                for _ in range(distill_steps):
+                    opt.zero_grad()
+                    pred = policy_net(X)
+                    loss = loss_fn(pred, Y)
+                    loss.backward()
+                    opt.step()
+
+            # run one initial distillation so policy_net is aligned immediately
+            distill_into_nn(best_theta)
+            best_policy = copy.deepcopy(policy_net.state_dict())
+
+        # ---- sample one candidate ----
+        theta = theta_mean + theta_std * rng.standard_normal(theta_mean.shape).astype(np.float32)
+
+        # enforce constraints: 0 <= s < S <= s_ub
+        s = np.clip(theta[0::2], 0.0, s_ub - 1.0)
+        S = np.clip(theta[1::2], 1.0, s_ub)
+
+        # make sure S is always above s by at least 1 unit
+        S = np.maximum(S, s + 1.0)
+
+        theta[0::2] = s
+        theta[1::2] = S
+
+        # ---- evaluate ----
+        score = eval_theta(theta)
+
+        gen_thetas.append(theta)
+        gen_scores.append(score)
+
+        # record learning curve
+        plot_data["reward_history"].append(score)
+        plot_data["episodes"].append(episode)
+
+        # update global best
+        if score > best_reward:
+            best_reward = score
+            best_theta = theta.copy()
+
+            # distill best heuristic into NN weights (so returned policy works with evaluator)
+            distill_into_nn(best_theta)
+            best_policy = copy.deepcopy(policy_net.state_dict())
+
+            # save improved NN
+            torch.save(best_policy, save_f_path)
+
+        # ---- end of generation: update mean/std from elites ----
+        if len(gen_scores) >= pop_size:
+            scores_arr = np.array(gen_scores, dtype=np.float32)
+            thetas_arr = np.array(gen_thetas, dtype=np.float32)
+
+            elite_idx = np.argsort(scores_arr)[-n_elite:]
+            elites = thetas_arr[elite_idx]
+
+            new_mean = elites.mean(axis=0)
+            new_std = elites.std(axis=0) + 1e-3
+
+            # smooth updates to avoid collapse
+            theta_mean = 0.7 * theta_mean + 0.3 * new_mean
+            theta_std = 0.8 * theta_std + 0.2 * new_std
+
+            # prevent tiny exploration (helps avoid getting stuck)
+            theta_std = np.maximum(theta_std, 0.02 * np.repeat(s_ub, 2))
+
+            # reset generation buffers
+            gen_thetas = []
+            gen_scores = []
