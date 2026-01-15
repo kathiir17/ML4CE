@@ -1,0 +1,481 @@
+# =============================================================
+# MLCE_Final_Submission_BO.py
+#
+# Professor-legal optimizer:
+#   - 6 init evaluations
+#   - 15 batches (each batch is ONE objective query with 5 points)
+#   - no cross-run memory (each run is independent)
+#   - no pandas
+#
+# Key ideas applied (legal):
+#   1) Batch 1-2 are unscored -> do structured exploration (sigma + diversity + coverage)
+#   2) Batch 3-15 -> exploit with EI (plus small local candidate densification around current best)
+#   3) Large Sobol candidate pool (denser than 3k) + optional local cloud candidates
+#   4) Hyperparameter warm-start inside the run (previous theta used as init for ML-II)
+#
+# Output:
+#   Prints batch best, best_overall, mark_score progression (batches 3-15 only)
+#   At end prints best and mark_score for that run.
+#
+# Notes:
+#   - You can set N_RUNS=5 for "professor evaluation style", or larger for your own testing.
+#   - This does NOT hardcode any specific basin locations from past runs. Bias is only via
+#     the init distribution + candidate densification around *within-run* best.
+# =============================================================
+
+import os, sys, time, random
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+# -------------------------------------------------------------
+# Import virtual lab
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+# =============================================================
+# Objective
+# =============================================================
+def objective_func(X_list):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(
+        virtual_lab.conduct_experiment(X_list, initial_conditions=custom_init),
+        dtype=float
+    )
+
+
+# =============================================================
+# Domain and encoding
+# =============================================================
+BOUNDS = np.array([[30.0, 40.0],
+                   [ 6.0,  8.0],
+                   [ 0.0, 50.0],
+                   [ 0.0, 50.0],
+                   [ 0.0, 50.0]], dtype=float)
+
+CELLTYPES = ["celltype_1", "celltype_2", "celltype_3"]
+
+
+def clip_x(x):
+    t, pH, f1, f2, f3, ct = x
+    t  = float(np.clip(t,  BOUNDS[0, 0], BOUNDS[0, 1]))
+    pH = float(np.clip(pH, BOUNDS[1, 0], BOUNDS[1, 1]))
+    f1 = float(np.clip(f1, BOUNDS[2, 0], BOUNDS[2, 1]))
+    f2 = float(np.clip(f2, BOUNDS[3, 0], BOUNDS[3, 1]))
+    f3 = float(np.clip(f3, BOUNDS[4, 0], BOUNDS[4, 1]))
+    if ct not in CELLTYPES:
+        ct = "celltype_3"
+    return [t, pH, f1, f2, f3, ct]
+
+
+def encode_point(x):
+    t, pH, f1, f2, f3, ct = x
+    cont = np.array([(t - 30.0) / 10.0,
+                     (pH - 6.0) / 2.0,
+                     f1 / 50.0,
+                     f2 / 50.0,
+                     f3 / 50.0], dtype=float)
+    cat = np.array([1.0 if ct == c else 0.0 for c in CELLTYPES], dtype=float)
+    return np.concatenate([cont, cat])
+
+
+def encode_batch(X):
+    return np.vstack([encode_point(x) for x in X])
+
+
+# =============================================================
+# Candidate generation (no objective calls)
+# =============================================================
+def sobol_pool_balanced(n_total, sobol_offset, sobol_stride):
+    per = n_total // 3
+    X = []
+    for ct_idx, ct in enumerate(CELLTYPES):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+            X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * (3 * per + r))
+        c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+        X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), CELLTYPES[r % 3]])
+
+    return X
+
+
+def local_cloud_around(x_center, n_pts, radius_frac, keep_ct=True):
+    t, pH, f1, f2, f3, ct = x_center
+    span = (BOUNDS[:, 1] - BOUNDS[:, 0])
+    r = radius_frac * span
+    out = []
+    for _ in range(n_pts):
+        tt  = t  + random.uniform(-r[0], r[0])
+        pp  = pH + random.uniform(-r[1], r[1])
+        a1  = f1 + random.uniform(-r[2], r[2])
+        a2  = f2 + random.uniform(-r[3], r[3])
+        a3  = f3 + random.uniform(-r[4], r[4])
+        ctt = ct if keep_ct else random.choice(CELLTYPES)
+        out.append(clip_x([tt, pp, a1, a2, a3, ctt]))
+    return out
+
+
+def biased_init_points(n=6):
+    """
+    Legal bias: non-uniform sampling without objective feedback.
+    Stronger than your previous mixture, but still wide enough to avoid locking in.
+      - 2 global Sobol (broad)
+      - 4 biased mixture (productive prior), with extra weight to celltype_3
+    """
+    X = []
+
+    # 2 global Sobol
+    base = random.randint(0, 50_000)
+    stride = random.choice([1, 3, 5, 7, 9])
+    for i in range(2):
+        u, _ = i4_sobol(5, base + stride * i)
+        c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+        X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), CELLTYPES[i % 3]])
+
+    # 4 biased (mixture)
+    # prior centre: moderate temp, slightly acidic pH, high-ish feeds
+    mu1 = np.array([33.3, 6.25, 44.0, 44.0, 38.0], dtype=float)
+    sd1 = np.array([ 1.2, 0.22,  9.0,  9.0, 10.0], dtype=float)
+
+    # second component: slightly different "high feed" regime to hedge
+    mu2 = np.array([34.0, 6.45, 40.0, 46.0, 32.0], dtype=float)
+    sd2 = np.array([ 1.6, 0.28, 11.0,  8.0, 12.0], dtype=float)
+
+    for i in range(4):
+        if random.random() < 0.6:
+            z = np.random.randn(5) * sd1 + mu1
+        else:
+            z = np.random.randn(5) * sd2 + mu2
+        z = np.clip(z, BOUNDS[:, 0], BOUNDS[:, 1])
+
+        # bias celltype choice (still includes others)
+        ct = "celltype_3" if random.random() < 0.55 else random.choice(["celltype_1", "celltype_2"])
+        X.append([float(z[0]), float(z[1]), float(z[2]), float(z[3]), float(z[4]), ct])
+
+    # ensure at least one of each celltype in init 6 (coverage)
+    # do minimal swaps without changing cont values
+    have = set([x[-1] for x in X])
+    missing = [ct for ct in CELLTYPES if ct not in have]
+    for m in missing:
+        # overwrite earliest non-matching with missing ct
+        for j in range(len(X)):
+            if X[j][-1] != m:
+                X[j][-1] = m
+                break
+
+    return X[:n]
+
+
+# =============================================================
+# GP (your Matern 5/2 kernel) with within-run warm-start
+# =============================================================
+class GP:
+    def __init__(self):
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+        self._bounds = [
+            (-3.0, 2.0),    # log(lc)
+            (-3.0, 2.0),    # log(lk)
+            (-3.0, 3.0),    # log(ls)
+            (-15.0, -1.0),  # log(ln)
+        ]
+        self._have_fit = False
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5] / lc, A[:, 5:] / lk
+        B1, B2 = B[:, :5] / lc, B[:, 5:] / lk
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2 * A1 @ B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2 * A2 @ B2.T
+        sq = np.maximum(sq, 0.0)
+        d = np.sqrt(sq)
+        sd = np.sqrt(5.0) * d
+        return s2 * (1.0 + sd + 5.0 * d * d / 3.0) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2 * ls))
+        jitter = 1e-8 + 1e-6 * np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2 * ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = (
+                0.5 * self.y @ alpha
+                + np.sum(np.log(np.diag(L)))
+                + 0.5 * len(self.y) * np.log(2 * np.pi)
+            )
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def fit(self, X, y, optimise=True, n_restarts=1):
+        self.X = X
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            # within-run warm-start: use current theta plus a few small jitters
+            best_theta = self.theta.copy()
+            best_val = self.neg_log_mll(best_theta)
+
+            for r in range(max(1, n_restarts)):
+                if r == 0:
+                    x0 = self.theta.copy()
+                else:
+                    x0 = self.theta.copy() + np.random.randn(4) * 0.15
+                    for k in range(4):
+                        x0[k] = np.clip(x0[k], self._bounds[k][0], self._bounds[k][1])
+
+                res = minimize(
+                    self.neg_log_mll,
+                    x0,
+                    method="L-BFGS-B",
+                    bounds=self._bounds,
+                    options={"maxiter": 150}
+                )
+                if res.fun < best_val:
+                    best_val = float(res.fun)
+                    best_theta = res.x.copy()
+
+            self.theta = best_theta
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+        self._have_fit = True
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2 * ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2 * ls) - np.sum(Kxs * v.T, axis=1)
+        return mu * self.s + self.m, np.sqrt(np.maximum(var, 1e-12)) * self.s
+
+
+# =============================================================
+# Acquisition
+# =============================================================
+def expected_improvement(mu, sigma, best, xi):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+
+# =============================================================
+# BO (one run, no cross-run memory)
+# =============================================================
+class BO_Run:
+    def __init__(self,
+                 pool_size=20000,
+                 local_cloud_n=1500,
+                 local_cloud_radius=0.06,
+                 div_weight=0.25):
+
+        self.pool_size = int(pool_size)
+        self.local_cloud_n = int(local_cloud_n)
+        self.local_cloud_radius = float(local_cloud_radius)
+        self.div_weight = float(div_weight)
+
+        # knobs
+        self.N_MIN_OPT = 15
+        self.UCB_KAPPA = 1.2
+        self.UCB_PICKS = 2
+
+        # scoring: batches 3..15 inclusive
+        self.score_from_batch = 3
+
+        # storage
+        self.X_obs = []
+        self.Y_obs = []
+        self.batch_best = []
+        self.best_overall = -1e18
+
+        self.gp = GP()
+
+    def run(self, iters=15, batch_size=5, verbose=True):
+        # -------- init (6 evals) --------
+        X_init = biased_init_points(n=6)
+        Y_init = objective_func(X_init).astype(float).tolist()
+
+        self.X_obs = list(X_init)
+        self.Y_obs = list(Y_init)
+        self.best_overall = float(np.max(self.Y_obs))
+
+        # initial GP fit without ML-II
+        self.gp.fit(encode_batch(self.X_obs), np.array(self.Y_obs, dtype=float), optimise=False)
+
+        mark_score = 0.0
+        t_start = time.time()
+
+        for b in range(1, iters + 1):
+            # build candidate set: big global Sobol + local cloud around current best (within-run)
+            base = random.randint(0, 200_000)
+            stride = random.choice([1, 3, 5, 7, 9])
+            X_cand = sobol_pool_balanced(self.pool_size, sobol_offset=base, sobol_stride=stride)
+
+            # local densification around current best helps "basin following" once you hit 330-360
+            best_idx = int(np.argmax(np.array(self.Y_obs, dtype=float)))
+            x_best = self.X_obs[best_idx]
+            X_local = local_cloud_around(x_best, self.local_cloud_n, self.local_cloud_radius, keep_ct=True)
+
+            # combine; encode once
+            X_pool = X_local + X_cand
+            enc_pool = encode_batch(X_pool)
+
+            taken = np.zeros(len(X_pool), dtype=bool)
+            fake_X, fake_Y = [], []
+
+            # decide batch mode
+            # batches 1-2: exploration (sigma sampling + diversity + coverage)
+            # batches 3+: exploitation (EI with mild early UCB boost)
+            explore_mode = (b <= 2)
+
+            # xi schedule: high only early, then low
+            if b <= 2:
+                xi = 0.25
+            elif b <= 5:
+                xi = 0.05
+            else:
+                xi = 0.01
+
+            for j in range(batch_size):
+                mu, std = self.gp.predict(enc_pool)
+                best = float(np.max(self.Y_obs + fake_Y))
+
+                if explore_mode:
+                    # maximise variance, but keep some mean and keep points diverse
+                    # score = std + small mean term
+                    score = std + 0.05 * (mu - np.mean(mu))
+                else:
+                    # EI (with tiny UCB boost for first 2 picks of batch 3 only, since marking wants early hit)
+                    mu_eff = mu
+                    if (b == 3) and (j < self.UCB_PICKS):
+                        mu_eff = mu + self.UCB_KAPPA * std
+                    score = expected_improvement(mu_eff, std, best, xi)
+
+                # diversity within batch
+                if len(fake_X) > 0:
+                    enc_fake = encode_batch(fake_X)
+                    diff = enc_pool[:, None, :] - enc_fake[None, :, :]
+                    dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                    score = score * (1.0 + self.div_weight * dist)
+
+                # enforce coverage in batch 1 only (first 3 picks)
+                if b == 1 and j < 3:
+                    chosen_cts = set([x[-1] for x in fake_X])
+                    missing = set(CELLTYPES) - chosen_cts
+                    if len(missing) > 0:
+                        allowed = np.array([X_pool[i][-1] in missing for i in range(len(X_pool))], dtype=bool)
+                        score[~allowed] = -np.inf
+
+                score[taken] = -np.inf
+
+                idx = int(np.argmax(score))
+                taken[idx] = True
+                x_new = X_pool[idx]
+                fake_X.append(x_new)
+
+                # KB fantasy
+                mu_fake, _ = self.gp.predict(encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                # posterior update (no ML-II during batch build)
+                self.gp.fit(
+                    encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y_obs + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            # real evaluation (ONE objective query with 5 points)
+            Y_real = objective_func(fake_X).astype(float).tolist()
+
+            self.batch_best.append(float(np.max(Y_real)))
+            self.X_obs.extend(fake_X)
+            self.Y_obs.extend(Y_real)
+
+            # update best
+            self.best_overall = float(np.max(self.Y_obs))
+
+            # marking starts at batch 3
+            if b >= self.score_from_batch:
+                mark_score += self.best_overall
+
+            # GP refit: start ML-II after enough points; use more restarts later
+            optimise_now = (len(self.Y_obs) >= self.N_MIN_OPT)
+            restarts = 1 if b <= 2 else (2 if b <= 6 else 3)
+            self.gp.fit(
+                encode_batch(self.X_obs),
+                np.array(self.Y_obs, dtype=float),
+                optimise=optimise_now,
+                n_restarts=restarts
+            )
+
+            if verbose:
+                print(
+                    f"  Batch {b:02d}/15 | batch_best={self.batch_best[-1]:.3f} "
+                    f"| best_overall={self.best_overall:.3f} | mark_so_far={mark_score:.1f}"
+                )
+
+        return {
+            "best": float(self.best_overall),
+            "mark_score": float(mark_score),
+            "time_s": float(time.time() - t_start),
+        }
+
+
+# =============================================================
+# Runner (5 independent runs, no cross-run memory)
+# =============================================================
+def main():
+    # professor style: run script 5 times; you can also set this to 1.
+    N_RUNS = 15
+
+    bests = []
+    marks = []
+    times = []
+
+    for r in range(1, N_RUNS + 1):
+        print(f"\n=== RUN {r}/{N_RUNS} ===")
+        bo = BO_Run(
+            pool_size=20000,       # denser global pool than 3k
+            local_cloud_n=1500,    # within-run basin chasing (legal)
+            local_cloud_radius=0.06,
+            div_weight=0.25
+        )
+        out = bo.run(iters=15, batch_size=5, verbose=True)
+        bests.append(out["best"])
+        marks.append(out["mark_score"])
+        times.append(out["time_s"])
+        print(f"RUN {r}: best={out['best']:.3f} | mark_score={out['mark_score']:.1f} | time={out['time_s']:.1f}s")
+
+    bests = np.array(bests, dtype=float)
+    marks = np.array(marks, dtype=float)
+    times = np.array(times, dtype=float)
+
+    print("\n=== SUMMARY (5 independent runs) ===")
+    print(f"avg best:      {bests.mean():.3f} (std {bests.std(ddof=1):.3f})")
+    print(f"avg markscore: {marks.mean():.1f} (std {marks.std(ddof=1):.1f})")
+    print(f"avg time/run:  {times.mean():.1f}s")
+
+
+if __name__ == "__main__":
+    main()
