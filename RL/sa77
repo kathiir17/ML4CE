@@ -1,0 +1,197 @@
+import copy
+import time
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from common import PolicyNetwork
+from ML4CE_RL_environment import MESCEnv
+from utils import setup_model_saving
+
+
+def your_optimization_alg(
+    env: MESCEnv,
+    policy_net: PolicyNetwork,
+    *,
+    max_episodes=2000,
+    max_time=5 * 60,  # seconds
+):
+    # Create file to store model weights
+    save_f_path = setup_model_saving(algorithm="Your algorithm")
+
+    # Buffers for plotting
+    plot_data = {"reward_history": [], "episodes": []}
+
+    # Book-keeping
+    start_time = time.time()
+    best_reward = -np.inf
+    best_policy = copy.deepcopy(policy_net.state_dict())
+
+    # -----------------------------------------------------------------------------------
+    # PLEASE DO NOT MODIFY THE CODE ABOVE THIS LINE
+    # -----------------------------------------------------------------------------------
+
+    # =========================
+    # Helper functions
+    # =========================
+    def run_episode(env, policy_net):
+        env.reset()
+        state = env.state
+        done = False
+        total_reward = 0.0
+
+        prev_action = None
+        volatility = 0.0
+
+        while not done:
+            with torch.no_grad():
+                action_mean = policy_net(torch.FloatTensor(state))
+
+            action = np.clip(
+                np.round(action_mean.numpy()),
+                env.action_space.low,
+                env.action_space.high,
+            ).astype(np.int16)
+
+            if prev_action is not None:
+                volatility += np.sum(np.abs(action - prev_action))
+            prev_action = action
+
+            state, reward, done, _ = env.step(action)
+            total_reward += reward
+
+        # volatility penalty (forces stable policies)
+        return total_reward - 0.05 * volatility
+
+    def evaluate(env, policy_net, K):
+        rewards = [run_episode(env, policy_net) for _ in range(K)]
+        # median-based objective (robust > lucky)
+        return np.median(rewards)
+
+    def get_flat_params(model):
+        return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+    def set_flat_params(model, flat):
+        idx = 0
+        for p in model.parameters():
+            n = p.numel()
+            p.data.copy_(flat[idx:idx+n].view_as(p))
+            idx += n
+
+    # =========================
+    # Simulated Annealing setup
+    # =========================
+    T = 2.5
+    T_min = 1e-3
+    alpha = 0.9985
+
+    noise = 0.12
+    base_noise = noise
+
+    K_fast = 2
+    K_slow = 6
+
+    stagnation_limit = 300
+    jump_every = 25
+
+    current_params = get_flat_params(policy_net)
+    current_reward = evaluate(env, policy_net, K_slow)
+
+    best_reward = current_reward
+    best_params = current_params.clone()
+    best_policy = copy.deepcopy(policy_net.state_dict())
+    torch.save(best_policy, save_f_path)
+
+    stagnation_counter = 0
+
+    # =========================
+    # Last-layer mask
+    # =========================
+    flat_dim = current_params.numel()
+    last_layer_mask = torch.zeros(flat_dim)
+
+    idx = 0
+    for name, p in policy_net.named_parameters():
+        n = p.numel()
+        if "fc3" in name:
+            last_layer_mask[idx:idx+n] = 1.0
+        idx += n
+
+    # =========================
+    # Optimization loop
+    # =========================
+    for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
+
+        flat = current_params.clone()
+        progress = episode / max_episodes
+
+        # exploration → exploitation
+        if progress < 0.6:
+            mask = torch.ones_like(flat)
+        else:
+            mask = last_layer_mask
+            noise = min(noise, 0.06)
+
+        # proposal
+        if episode % jump_every == 0:
+            step = torch.randn_like(flat) / (torch.rand_like(flat) ** 0.5)
+            proposal = flat + noise * step
+        else:
+            proposal = flat + noise * torch.randn_like(flat) * mask
+
+        set_flat_params(policy_net, proposal)
+
+        K_eval = K_fast if progress < 0.6 else K_slow
+        candidate_reward = evaluate(env, policy_net, K_eval)
+
+        delta = candidate_reward - current_reward
+
+        if delta > 0 or np.random.rand() < np.exp(delta / T):
+            current_params = proposal
+            current_reward = candidate_reward
+        else:
+            set_flat_params(policy_net, current_params)
+
+        if current_reward > best_reward:
+            best_reward = current_reward
+            best_params = current_params.clone()
+            best_policy = copy.deepcopy(policy_net.state_dict())
+            torch.save(best_policy, save_f_path)
+            stagnation_counter = 0
+            noise *= 0.97
+        else:
+            stagnation_counter += 1
+            noise *= 1.01
+
+        noise = np.clip(noise, 0.03, 0.35)
+        T = max(T * alpha, T_min)
+
+        # elite restart
+        if stagnation_counter > stagnation_limit:
+            T = 2.5
+            noise = base_noise
+            stagnation_counter = 0
+            current_params = best_params + 0.02 * torch.randn_like(best_params)
+            set_flat_params(policy_net, current_params)
+            current_reward = evaluate(env, policy_net, K_slow)
+
+        plot_data["episodes"].append(episode)
+        plot_data["reward_history"].append(best_reward)
+
+        # -----------------------------------------------------------------------------------
+        # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
+        # -----------------------------------------------------------------------------------
+        if (time.time() - start_time) > max_time:
+            break
+
+    print(f"Policy model weights saved in: {save_f_path}")
+    print(f"Best reward: {best_reward}")
+
+    team_names = [
+        "Del Rio Chanona, Antonio",
+        "Fons, Isabela",
+    ]
+    cids = ["16879875", "06089513"]
+    question = [1, 0]
+
+    return best_policy, plot_data
