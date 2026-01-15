@@ -1,0 +1,528 @@
+# =============================================================
+# MLCE_Final_Submission_BO_FAST_v2.py
+#
+# Based on your FAST version (shortlist once per batch, KB on shortlist).
+# Changes applied
+# 1) Added _safe_y and made objective_func return safe values
+# 2) Replaced initial design so it uses ONLY 2 biased points total
+#    4 global Sobol points over full bounds
+#    2 biased points drawn from broad Gaussians around high feed region
+#    then enforce balanced celltype coverage
+# 3) Kept the rest of the FAST logic unchanged
+# =============================================================
+
+import os, sys, time, random
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+def _safe_y(y, bad_value=-1e6):
+    y = np.asarray(y, dtype=float)
+    y[~np.isfinite(y)] = bad_value
+    return y
+
+
+def objective_func(X_list):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    y = np.array(
+        virtual_lab.conduct_experiment(X_list, initial_conditions=custom_init),
+        dtype=float
+    )
+    return _safe_y(y)
+
+
+BOUNDS = np.array([[30.0, 40.0],
+                   [ 6.0,  8.0],
+                   [ 0.0, 50.0],
+                   [ 0.0, 50.0],
+                   [ 0.0, 50.0]], dtype=float)
+
+CELLTYPES = ["celltype_1", "celltype_2", "celltype_3"]
+
+
+def clip_x(x):
+    t, pH, f1, f2, f3, ct = x
+    t  = float(np.clip(t,  BOUNDS[0, 0], BOUNDS[0, 1]))
+    pH = float(np.clip(pH, BOUNDS[1, 0], BOUNDS[1, 1]))
+    f1 = float(np.clip(f1, BOUNDS[2, 0], BOUNDS[2, 1]))
+    f2 = float(np.clip(f2, BOUNDS[3, 0], BOUNDS[3, 1]))
+    f3 = float(np.clip(f3, BOUNDS[4, 0], BOUNDS[4, 1]))
+    if ct not in CELLTYPES:
+        ct = "celltype_3"
+    return [t, pH, f1, f2, f3, ct]
+
+
+def encode_point(x):
+    t, pH, f1, f2, f3, ct = x
+    cont = np.array([(t - 30.0) / 10.0,
+                     (pH - 6.0) / 2.0,
+                     f1 / 50.0,
+                     f2 / 50.0,
+                     f3 / 50.0], dtype=float)
+    cat = np.array([1.0 if ct == c else 0.0 for c in CELLTYPES], dtype=float)
+    return np.concatenate([cont, cat])
+
+
+def encode_batch(X):
+    return np.vstack([encode_point(x) for x in X])
+
+
+def sobol_pool_balanced(n_total, sobol_offset, sobol_stride):
+    per = n_total // 3
+    X = []
+    for ct_idx, ct in enumerate(CELLTYPES):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+            X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * (3 * per + r))
+        c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+        X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), CELLTYPES[r % 3]])
+
+    return X
+
+
+def local_cloud_around(x_center, n_pts, radius_frac, keep_ct=True):
+    t, pH, f1, f2, f3, ct = x_center
+    span = (BOUNDS[:, 1] - BOUNDS[:, 0])
+    r = radius_frac * span
+    out = []
+    for _ in range(int(n_pts)):
+        tt  = t  + random.uniform(-r[0], r[0])
+        pp  = pH + random.uniform(-r[1], r[1])
+        a1  = f1 + random.uniform(-r[2], r[2])
+        a2  = f2 + random.uniform(-r[3], r[3])
+        a3  = f3 + random.uniform(-r[4], r[4])
+        ctt = ct if keep_ct else random.choice(CELLTYPES)
+        out.append(clip_x([tt, pp, a1, a2, a3, ctt]))
+    return out
+
+
+def biased_init_points(n=6):
+    """
+    ONLY 2 biased points total
+    4 global Sobol points over full bounds
+    2 biased points around high feed region (broad, not a tight spike)
+    balanced celltype coverage enforced
+    """
+    n = int(n)
+    if n != 6:
+        n = 6
+
+    X = []
+    base = random.randint(0, 120_000)
+    stride = random.choice([1, 3, 5, 7, 9])
+
+    for i in range(4):
+        u, _ = i4_sobol(5, base + stride * i)
+        c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+        X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), CELLTYPES[i % 3]])
+
+    mu1 = np.array([33.4, 6.20, 46.0, 46.0, 40.0], dtype=float)
+    sd1 = np.array([ 1.2, 0.22,  8.0,  8.0,  9.0], dtype=float)
+    mu2 = np.array([34.2, 6.40, 42.0, 48.0, 34.0], dtype=float)
+    sd2 = np.array([ 1.5, 0.26, 10.0,  7.5, 11.0], dtype=float)
+
+    for j in range(2):
+        if random.random() < 0.55:
+            z = np.random.randn(5) * sd1 + mu1
+        else:
+            z = np.random.randn(5) * sd2 + mu2
+        z = np.clip(z, BOUNDS[:, 0], BOUNDS[:, 1])
+
+        if j == 0:
+            z[2:] = np.maximum(z[2:], 44.0)
+        else:
+            z[2:] = np.maximum(z[2:], 40.0)
+
+        ct = CELLTYPES[(4 + j) % 3]
+        X.append([float(z[0]), float(z[1]), float(z[2]), float(z[3]), float(z[4]), ct])
+
+    want = ["celltype_1", "celltype_1", "celltype_2", "celltype_2", "celltype_3", "celltype_3"]
+    for i in range(6):
+        X[i][-1] = want[i]
+
+    seen = set()
+    out = []
+    for x in X:
+        key = (round(x[0], 3), round(x[1], 3), round(x[2], 3), round(x[3], 3), round(x[4], 3), x[5])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(x)
+
+    while len(out) < n:
+        u, _ = i4_sobol(5, base + stride * (len(out) + 30))
+        c = BOUNDS[:, 0] + u * (BOUNDS[:, 1] - BOUNDS[:, 0])
+        out.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), CELLTYPES[len(out) % 3]])
+
+    return out[:n]
+
+
+class GP:
+    def __init__(self):
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+        self._bounds = [(-3.0, 2.0), (-3.0, 2.0), (-3.0, 3.0), (-15.0, -1.0)]
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5] / lc, A[:, 5:] / lk
+        B1, B2 = B[:, :5] / lc, B[:, 5:] / lk
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2 * A1 @ B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2 * A2 @ B2.T
+        sq = np.maximum(sq, 0.0)
+        d = np.sqrt(sq)
+        sd = np.sqrt(5.0) * d
+        return s2 * (1.0 + sd + 5.0 * d * d / 3.0) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2 * ls))
+        jitter = 1e-8 + 1e-6 * np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2 * ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = 0.5 * self.y @ alpha + np.sum(np.log(np.diag(L))) + 0.5 * len(self.y) * np.log(2 * np.pi)
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def fit(self, X, y, optimise=True, n_restarts=1, maxiter=90):
+        self.X = X
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            best_theta = self.theta.copy()
+            best_val = self.neg_log_mll(best_theta)
+
+            for r in range(max(1, int(n_restarts))):
+                if r == 0:
+                    x0 = self.theta.copy()
+                else:
+                    x0 = self.theta.copy() + np.random.randn(4) * 0.12
+                    for k in range(4):
+                        x0[k] = np.clip(x0[k], self._bounds[k][0], self._bounds[k][1])
+
+                res = minimize(
+                    self.neg_log_mll, x0, method="L-BFGS-B", bounds=self._bounds,
+                    options={"maxiter": int(maxiter)}
+                )
+                if res.fun < best_val:
+                    best_val = float(res.fun)
+                    best_theta = res.x.copy()
+            self.theta = best_theta
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2 * ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2 * ls) - np.sum(Kxs * v.T, axis=1)
+        return mu * self.s + self.m, np.sqrt(np.maximum(var, 1e-12)) * self.s
+
+
+def expected_improvement(mu, sigma, best, xi):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+
+class BO_Run:
+    def __init__(self, global_pool_size=12000, shortlist_M=1200, div_weight=0.25):
+        self.global_pool_size = int(global_pool_size)
+        self.shortlist_M = int(shortlist_M)
+        self.div_weight = float(div_weight)
+
+        self.N_MIN_OPT = 15
+        self.UCB_KAPPA = 1.2
+        self.UCB_PICKS = 2
+        self.score_from_batch = 3
+
+        self.X_obs = []
+        self.Y_obs = []
+        self.batch_best = []
+        self.best_overall = -1e18
+
+        self.gp = GP()
+        self.global_pool_X = None
+        self.global_pool_enc = None
+
+    def _tr_radius_for_best(self, best_overall: float) -> float:
+        if best_overall >= 330.0:
+            return 0.03
+        if best_overall >= 300.0:
+            return 0.05
+        return 0.08
+
+    def _local_cloud_n_for_best(self, best_overall: float) -> int:
+        if best_overall >= 330.0:
+            return 900
+        if best_overall >= 300.0:
+            return 600
+        if best_overall >= 280.0:
+            return 300
+        return 0
+
+    def _apply_mean_gated_uncertainty(self, score, mu, gate_q=0.60):
+        cut = float(np.quantile(mu, gate_q))
+        out = score.copy()
+        out[mu < cut] = -np.inf
+        return out
+
+    def _ml2_plan(self, batch_idx: int):
+        if batch_idx in [3, 5]:
+            return True, 2, 90
+        if batch_idx in [9, 15]:
+            return True, 1, 80
+        return False, 0, 0
+
+    def _global_pool_take(self, batch_idx: int) -> int:
+        if batch_idx <= 5:
+            return min(self.global_pool_size, 12000)
+        if batch_idx <= 10:
+            return min(self.global_pool_size, 8000)
+        return min(self.global_pool_size, 6000)
+
+    def _ensure_global_pool(self):
+        if self.global_pool_X is not None:
+            return
+        base = random.randint(0, 300_000)
+        stride = random.choice([1, 3, 5, 7, 9])
+        self.global_pool_X = sobol_pool_balanced(self.global_pool_size, sobol_offset=base, sobol_stride=stride)
+        self.global_pool_enc = encode_batch(self.global_pool_X)
+
+    def run(self, iters=15, batch_size=5, verbose=True):
+        X_init = biased_init_points(n=6)
+        Y_init = objective_func(X_init).astype(float).tolist()
+
+        self.X_obs = list(X_init)
+        self.Y_obs = list(Y_init)
+        self.best_overall = float(np.max(self.Y_obs))
+
+        self.gp.fit(encode_batch(self.X_obs), np.array(self.Y_obs, dtype=float), optimise=False)
+        self._ensure_global_pool()
+
+        mark_score = 0.0
+        t_start = time.time()
+        rescue_mode = False
+
+        for b in range(1, iters + 1):
+            explore_mode = (b <= 2)
+            rescue_active = rescue_mode and (b in [4, 5])
+
+            if b <= 2:
+                xi = 0.25
+            elif b <= 5:
+                xi = 0.05
+            else:
+                xi = 0.01
+
+            best_idx = int(np.argmax(np.array(self.Y_obs, dtype=float)))
+            x_best = self.X_obs[best_idx]
+
+            tr_r = self._tr_radius_for_best(self.best_overall)
+            n_loc = self._local_cloud_n_for_best(self.best_overall)
+
+            X_local = local_cloud_around(x_best, n_loc, tr_r, keep_ct=True) if n_loc > 0 else []
+            enc_local = encode_batch(X_local) if len(X_local) > 0 else None
+
+            takeN = self._global_pool_take(b)
+            X_cand = self.global_pool_X[:takeN]
+            enc_cand = self.global_pool_enc[:takeN]
+
+            if rescue_active:
+                muR = np.array([33.4, 6.30, 46.0, 46.0, 40.0], dtype=float)
+                sdR = np.array([ 1.0, 0.18,  6.5,  6.5,  8.5], dtype=float)
+                n_rescue = max(600, int(1.5 * takeN))
+                X_rescue = []
+                for _ in range(n_rescue):
+                    z = np.random.randn(5) * sdR + muR
+                    z = np.clip(z, BOUNDS[:, 0], BOUNDS[:, 1])
+                    ct = "celltype_3" if random.random() < 0.85 else random.choice(["celltype_1", "celltype_2"])
+                    X_rescue.append([float(z[0]), float(z[1]), float(z[2]), float(z[3]), float(z[4]), ct])
+                enc_rescue = encode_batch(X_rescue)
+
+                X_pool = X_rescue + X_local + X_cand
+                if enc_local is None:
+                    enc_pool = np.vstack([enc_rescue, enc_cand])
+                else:
+                    enc_pool = np.vstack([enc_rescue, enc_local, enc_cand])
+            else:
+                X_pool = X_local + X_cand
+                if enc_local is None:
+                    enc_pool = enc_cand
+                else:
+                    enc_pool = np.vstack([enc_local, enc_cand])
+
+            poolN = len(X_pool)
+            fake_X, fake_Y = [], []
+            taken_s = None
+            X_short = None
+            enc_short = None
+
+            mu0, std0 = self.gp.predict(enc_pool)
+            best0 = float(np.max(np.array(self.Y_obs, dtype=float)))
+
+            if explore_mode or rescue_active:
+                score0 = std0.copy()
+                gate = 0.60 if explore_mode else 0.75
+                score0 = self._apply_mean_gated_uncertainty(score0, mu0, gate_q=gate)
+                score0 = score0 + 0.02 * (mu0 - np.mean(mu0))
+            else:
+                mu_eff0 = mu0
+                if b == 3:
+                    mu_eff0 = mu0 + self.UCB_KAPPA * std0
+                score0 = expected_improvement(mu_eff0, std0, best0, xi)
+
+            M = min(self.shortlist_M, poolN)
+            finite = np.isfinite(score0)
+            if np.sum(finite) > M:
+                idx_short = np.argpartition(score0, -M)[-M:]
+            else:
+                idx_short = np.where(finite)[0]
+                if len(idx_short) == 0:
+                    idx_short = np.argpartition(std0, -M)[-M:]
+
+            idx_short = idx_short.tolist()
+            X_short = [X_pool[i] for i in idx_short]
+            enc_short = enc_pool[idx_short]
+            taken_s = np.zeros(len(idx_short), dtype=bool)
+
+            for j in range(batch_size):
+                mu, std = self.gp.predict(enc_short)
+                best = float(np.max(self.Y_obs + fake_Y))
+
+                if explore_mode or rescue_active:
+                    score = std.copy()
+                    gate = 0.60 if explore_mode else 0.75
+                    score = self._apply_mean_gated_uncertainty(score, mu, gate_q=gate)
+                    score = score + 0.02 * (mu - np.mean(mu))
+                else:
+                    mu_eff = mu
+                    if (b == 3) and (j < self.UCB_PICKS):
+                        mu_eff = mu + self.UCB_KAPPA * std
+                    score = expected_improvement(mu_eff, std, best, xi)
+
+                if len(fake_X) > 0:
+                    enc_fake = encode_batch(fake_X)
+                    diff = enc_short[:, None, :] - enc_fake[None, :, :]
+                    dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                    score = score * (1.0 + self.div_weight * dist)
+
+                if b == 1 and j < 3:
+                    chosen_cts = set([x[-1] for x in fake_X])
+                    missing = set(CELLTYPES) - chosen_cts
+                    if len(missing) > 0:
+                        allowed = np.array([X_short[i][-1] in missing for i in range(len(X_short))], dtype=bool)
+                        score[~allowed] = -np.inf
+
+                score[taken_s] = -np.inf
+                idxj = int(np.argmax(score))
+
+                taken_s[idxj] = True
+                x_new = X_short[idxj]
+                fake_X.append(x_new)
+
+                mu_fake, _ = self.gp.predict(encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                self.gp.fit(
+                    encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y_obs + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            Y_real = objective_func(fake_X).astype(float).tolist()
+
+            self.batch_best.append(float(np.max(Y_real)))
+            self.X_obs.extend(fake_X)
+            self.Y_obs.extend(Y_real)
+            self.best_overall = float(np.max(self.Y_obs))
+
+            if b == 3 and self.best_overall < 300.0:
+                rescue_mode = True
+
+            if b >= self.score_from_batch:
+                mark_score += self.best_overall
+
+            optimise_now, restarts, maxiter = self._ml2_plan(b)
+            if optimise_now and (len(self.Y_obs) >= self.N_MIN_OPT):
+                self.gp.fit(
+                    encode_batch(self.X_obs),
+                    np.array(self.Y_obs, dtype=float),
+                    optimise=True,
+                    n_restarts=restarts,
+                    maxiter=maxiter
+                )
+            else:
+                self.gp.fit(
+                    encode_batch(self.X_obs),
+                    np.array(self.Y_obs, dtype=float),
+                    optimise=False
+                )
+
+            if verbose:
+                s = (
+                    f"  Batch {b:02d}/15 | batch_best={self.batch_best[-1]:.3f} "
+                    f"| best_overall={self.best_overall:.3f} | mark_so_far={mark_score:.1f}"
+                )
+                if rescue_active:
+                    s += " | RESCUE"
+                print(s)
+
+        return {
+            "best": float(self.best_overall),
+            "mark_score": float(mark_score),
+            "time_s": float(time.time() - t_start),
+        }
+
+
+def main():
+    N_RUNS = 15
+    bests, marks, times = [], [], []
+
+    for r in range(1, N_RUNS + 1):
+        print(f"\n=== RUN {r}/{N_RUNS} ===")
+        bo = BO_Run(global_pool_size=12000, shortlist_M=1200, div_weight=0.25)
+        out = bo.run(iters=15, batch_size=5, verbose=True)
+        bests.append(out["best"])
+        marks.append(out["mark_score"])
+        times.append(out["time_s"])
+        print(f"RUN {r}: best={out['best']:.3f} | mark_score={out['mark_score']:.1f} | time={out['time_s']:.1f}s")
+
+    bests = np.array(bests, dtype=float)
+    marks = np.array(marks, dtype=float)
+    times = np.array(times, dtype=float)
+
+    print(f"\n=== SUMMARY ({N_RUNS} independent runs) ===")
+    print(f"avg best:      {bests.mean():.3f} (std {bests.std(ddof=1):.3f})")
+    print(f"avg markscore: {marks.mean():.1f} (std {marks.std(ddof=1):.1f})")
+    print(f"avg time/run:  {times.mean():.1f}s")
+
+
+if __name__ == "__main__":
+    main()
