@@ -1,0 +1,305 @@
+import copy
+import time
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from common import PolicyNetwork
+from ML4CE_RL_environment import MESCEnv
+from utils import setup_model_saving
+
+
+def your_optimization_alg(
+    env: MESCEnv,
+    policy_net: PolicyNetwork,
+    *,
+    max_episodes=2000,
+    max_time=5 * 60,
+):
+    # Create file to store model weights
+    save_f_path = setup_model_saving(algorithm="Your algorithm")
+
+    plot_data = {"reward_history": [], "episodes": []}
+
+    start_time = time.time()
+    best_reward = -np.inf
+    best_policy = copy.deepcopy(policy_net.state_dict())
+
+    # -----------------------------------------------------------------------------------
+    # PLEASE DO NOT MODIFY THE CODE ABOVE THIS LINE
+    # -----------------------------------------------------------------------------------
+
+    # =========================
+    # Utilities
+    # =========================
+    def get_flat_params(model):
+        return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+    def set_flat_params(model, flat):
+        idx = 0
+        for p in model.parameters():
+            n = p.numel()
+            p.data.copy_(flat[idx:idx+n].view_as(p))
+            idx += n
+
+    # =========================
+    # Episode rollout
+    # =========================
+    def run_episode(env, policy_net, demand=None):
+        env.demand_dataset = demand
+        env.reset()
+        state = env.state
+        done = False
+        total_reward = 0.0
+
+        while not done:
+            with torch.no_grad():
+                action_mean = policy_net(torch.FloatTensor(state))
+
+            action = np.clip(
+                np.round(action_mean.numpy()),
+                env.action_space.low,
+                env.action_space.high,
+            ).astype(np.int16)
+
+            state, reward, done, _ = env.step(action)
+            total_reward += reward
+
+        return total_reward
+
+    # =========================
+    # Risk-adjusted evaluation
+    # =========================
+    def evaluate(env, policy_net, K):
+        rewards = np.array([run_episode(env, policy_net) for _ in range(K)])
+        return rewards.mean() - 0.55 * rewards.std()
+
+    # =====================================================
+    # TWO-STAGE LEGAL WARM-UP (ROBUST + REFINED)
+    # =====================================================
+
+    capacities = np.array(
+        [r.order_quantity_limit for r in env.retailers] +
+        [dc.order_quantity_limit for dc in env.DCs],
+        dtype=np.float32
+    )
+
+    def teacher_action(state, s_frac):
+        inv = state[:-1]  # ignore weekday index
+        act = np.zeros_like(inv, dtype=np.float32)
+        for i in range(len(inv)):
+            s = s_frac[i] * capacities[i]
+            S = capacities[i]
+            if inv[i] <= s:
+                act[i] = min(S - inv[i], capacities[i])
+        return act
+
+    X, Y = [], []
+
+    # ---------------------
+    # STAGE 1: BROAD STABILISATION
+    # ---------------------
+    stage1_end = time.time() + 5.0
+
+    while time.time() < stage1_end:
+        env.reset()
+        done = False
+
+        # Randomised (s,S)
+        s_frac = np.random.uniform(0.25, 0.45, size=len(capacities))
+
+        while not done and time.time() < stage1_end:
+            s = env.state.copy()
+            a = teacher_action(s, s_frac)
+
+            X.append(s.astype(np.float32))
+            Y.append(a.astype(np.float32))
+
+            a_int = np.clip(
+                np.round(a),
+                env.action_space.low,
+                env.action_space.high,
+            ).astype(np.int16)
+
+            _, _, done, _ = env.step(a_int)
+
+    # ---------------------
+    # STAGE 2: RISK-AWARE REFINEMENT
+    # ---------------------
+    stage2_end = time.time() + 5.0
+
+    while time.time() < stage2_end:
+        env.reset()
+        done = False
+        episode_reward = 0.0
+
+        episode_X, episode_Y = [], []
+
+        # Narrower, safer (s,S)
+        s_frac = np.random.uniform(0.28, 0.38, size=len(capacities))
+
+        while not done and time.time() < stage2_end:
+            s = env.state.copy()
+            a = teacher_action(s, s_frac)
+
+            episode_X.append(s.astype(np.float32))
+            episode_Y.append(a.astype(np.float32))
+
+            a_int = np.clip(
+                np.round(a),
+                env.action_space.low,
+                env.action_space.high,
+            ).astype(np.int16)
+
+            _, r, done, _ = env.step(a_int)
+            episode_reward += r
+
+        # 🔑 ONLY KEEP GOOD TRAJECTORIES
+        if episode_reward > 9500:
+            X.extend(episode_X)
+            Y.extend(episode_Y)
+
+    # ---------------------
+    # SUPERVISED TRAINING
+    # ---------------------
+    if len(X) > 800:
+        X = torch.tensor(X)
+        Y = torch.tensor(Y)
+
+        opt = torch.optim.Adam(policy_net.parameters(), lr=3e-4)
+        loss_fn = torch.nn.SmoothL1Loss()
+
+        for _ in range(6):
+            perm = torch.randperm(len(X))
+            for i in range(0, len(X), 128):
+                b = perm[i:i+128]
+                loss = loss_fn(policy_net(X[b]), Y[b])
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
+                opt.step()
+
+
+
+    # =========================
+    # SA PARAMETERS
+    # =========================
+    T = 1.6
+    T_min = 3e-4
+    alpha = 0.9992
+
+    noise = 0.07
+    base_noise = noise
+
+    K_fast = 1
+    K_slow = 10
+
+    stagnation_limit = 200
+    refresh_every = 120
+
+    # =========================
+    # Fixed demand pool
+    # =========================
+    pool_size = 10
+    demand_pool = [env.sample_demands_episode()[0] for _ in range(pool_size)]
+
+    # =========================
+    # EMA tracking
+    # =========================
+    ema_beta = 0.10
+
+    current_params = get_flat_params(policy_net)
+    current_reward = evaluate(env, policy_net, K_slow)
+    current_ema = current_reward
+    best_ema = current_ema
+
+    best_reward = current_reward
+    best_params = current_params.clone()
+    torch.save(policy_net.state_dict(), save_f_path)
+
+    stagnation = 0
+
+    # =========================
+    # Last-layer mask
+    # =========================
+    flat_dim = current_params.numel()
+    last_layer_mask = torch.zeros(flat_dim)
+
+    idx = 0
+    for name, p in policy_net.named_parameters():
+        n = p.numel()
+        if "fc3" in name:
+            last_layer_mask[idx:idx+n] = 1.0
+        idx += n
+
+    # =========================
+    # MAIN LOOP
+    # =========================
+    for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
+
+        if episode % refresh_every == 0 and episode > 0:
+            j = np.random.randint(pool_size)
+            demand_pool[j] = env.sample_demands_episode()[0]
+
+        flat = current_params.clone()
+        progress = episode / max_episodes
+
+        if progress < 0.6:
+            mask = torch.ones_like(flat)
+            K_eval = K_fast
+        else:
+            mask = last_layer_mask
+            K_eval = K_slow
+            noise = min(noise, 0.05)
+
+        proposal = flat + noise * torch.randn_like(flat) * mask
+        set_flat_params(policy_net, proposal)
+
+        candidate_reward = evaluate(env, policy_net, K_eval)
+        candidate_ema = (1 - ema_beta) * current_ema + ema_beta * candidate_reward
+        delta = candidate_ema - current_ema
+
+        if delta > 0 or np.random.rand() < np.exp(delta / T):
+            current_params = proposal
+            current_reward = candidate_reward
+            current_ema = candidate_ema
+        else:
+            set_flat_params(policy_net, current_params)
+
+        if current_ema > best_ema:
+            best_reward = current_reward
+            best_ema = current_ema
+            best_params = current_params.clone()
+            torch.save(policy_net.state_dict(), save_f_path)
+            stagnation = 0
+            noise *= 0.97
+        else:
+            stagnation += 1
+            noise *= 1.01
+
+        noise = np.clip(noise, 0.01, 0.18)
+        T = max(T * alpha, T_min)
+
+        if stagnation > stagnation_limit:
+            noise = base_noise
+            stagnation = 0
+            current_params = best_params.clone()
+            set_flat_params(policy_net, current_params)
+
+        plot_data["episodes"].append(episode)
+        plot_data["reward_history"].append(best_reward)
+
+        # -----------------------------------------------------------------------------------
+        # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
+        # -----------------------------------------------------------------------------------
+        if (time.time() - start_time) > max_time:
+            break
+
+    print(f"Policy model weights saved in: {save_f_path}")
+    print(f"Best reward: {best_reward}")
+
+    team_names = ["Del Rio Chanona, Antonio", "Fons, Isabela"]
+    cids = ["16879875", "06089513"]
+    question = [1, 0]
+
+    return best_policy, plot_data
