@@ -1,0 +1,342 @@
+import copy
+import time
+import numpy as np
+import torch
+from tqdm import tqdm
+
+from common import PolicyNetwork
+from ML4CE_RL_environment import MESCEnv
+from utils import setup_model_saving
+
+
+def your_optimization_alg(
+    env: MESCEnv,
+    policy_net: PolicyNetwork,
+    *,
+    max_episodes=2000,
+    max_time=5 * 60,  # seconds
+):
+    # Create file to store model weights
+    save_f_path = setup_model_saving(algorithm="Your algorithm")
+
+    # Buffers for plotting
+    plot_data = {"reward_history": [], "episodes": []}
+
+    # Book-keeping
+    start_time = time.time()
+    best_reward = -np.inf
+    best_policy = copy.deepcopy(policy_net.state_dict())
+
+    # -----------------------------------------------------------------------------------
+    # PLEASE DO NOT MODIFY THE CODE ABOVE THIS LINE
+    # -----------------------------------------------------------------------------------
+
+    # ==========================================================
+    # Helper functions
+    # ==========================================================
+    def run_episode(env, policy_net, demand=None):
+        env.demand_dataset = demand
+        env.reset()
+
+        state = env.state
+        done = False
+        total_reward = 0.0
+
+        state_tensor = torch.zeros(len(state), dtype=torch.float32)
+
+        while not done:
+            state_tensor.copy_(torch.from_numpy(state))
+
+            with torch.no_grad():
+                action_mean = policy_net(state_tensor)
+
+            action = np.round(action_mean.numpy())
+            action = np.clip(action, env.action_space.low, env.action_space.high).astype(
+                np.int16
+            )
+
+            state, reward, done, _ = env.step(action)
+            total_reward += reward
+
+        return float(total_reward)
+
+    def evaluate(env, policy_net, K, demand_pool):
+        idx = np.random.randint(0, len(demand_pool), size=K)
+        rewards = [run_episode(env, policy_net, demand_pool[i]) for i in idx]
+
+        # trimmed mean (robust but optimistic)
+        rewards = np.sort(np.array(rewards, dtype=np.float64))
+        if len(rewards) >= 5:
+            k = max(1, int(0.2 * len(rewards)))
+            return float(np.mean(rewards[k:-k]))
+        return float(np.mean(rewards))
+
+    def get_flat_params(model):
+        return torch.cat([p.data.view(-1) for p in model.parameters()])
+
+    def set_flat_params(model, flat):
+        idx = 0
+        for p in model.parameters():
+            n = p.numel()
+            p.data.copy_(flat[idx : idx + n].view_as(p))
+            idx += n
+
+    def clip_params(model, max_abs=10.0):
+        for p in model.parameters():
+            p.data.clamp_(-max_abs, max_abs)
+
+    # ==========================================================
+    # WARM-UP (LEGAL): (s,S) imitation
+    # ==========================================================
+    capacities = np.array(
+        [r.order_quantity_limit for r in env.retailers]
+        + [dc.order_quantity_limit for dc in env.DCs],
+        dtype=np.float32,
+    )
+    s_teacher = capacities / 3.0
+    S_teacher = capacities
+
+    def teacher_action(state):
+        inv = state[:-1]
+        a = np.zeros_like(inv, dtype=np.float32)
+        for i in range(len(inv)):
+            if inv[i] <= s_teacher[i]:
+                a[i] = min(S_teacher[i] - inv[i], capacities[i])
+        return a
+
+    X, Y = [], []
+    warmup_time = 8.0
+    end_time = time.time() + warmup_time
+
+    while time.time() < end_time:
+        env.reset()
+        done = False
+        while not done and time.time() < end_time:
+            s = env.state.copy()
+            a = teacher_action(s)
+
+            X.append(s.astype(np.float32))
+            Y.append(a.astype(np.float32))
+
+            a_int = np.clip(np.round(a), env.action_space.low, env.action_space.high).astype(
+                np.int16
+            )
+            _, _, done, _ = env.step(a_int)
+
+    if len(X) > 256:
+        X = torch.tensor(np.array(X), dtype=torch.float32)
+        Y = torch.tensor(np.array(Y), dtype=torch.float32)
+
+        opt = torch.optim.Adam(policy_net.parameters(), lr=3e-4)
+        loss_fn = torch.nn.SmoothL1Loss()
+
+        for _ in range(5):
+            idx = torch.randperm(len(X))
+            for i in range(0, len(X), 128):
+                b = idx[i : i + 128]
+                loss = loss_fn(policy_net(X[b]), Y[b])
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
+                opt.step()
+
+    clip_params(policy_net)
+
+    # ==========================================================
+    # Simulated Annealing setup
+    # ==========================================================
+    T = 2.2
+    T_min = 5e-4
+    alpha = 0.9988
+
+    noise = 0.10
+    base_noise = noise
+
+    K_fast = 2
+    K_slow = 6
+
+    stagnation_limit = 250
+    jump_every = 120
+
+    # fixed demand pool (stable comparisons)
+    demand_pool = [env.sample_demands_episode()[0] for _ in range(10)]
+
+    current_params = get_flat_params(policy_net)
+    current_reward = evaluate(env, policy_net, K_slow, demand_pool)
+
+    best_reward = current_reward
+    best_policy = copy.deepcopy(policy_net.state_dict())
+    best_params = current_params.clone()
+    torch.save(best_policy, save_f_path)
+
+    stagnation_counter = 0
+
+    # layer mask (output layer)
+    flat_dim = current_params.numel()
+    last_layer_mask = torch.zeros(flat_dim)
+
+    idx = 0
+    for name, p in policy_net.named_parameters():
+        n = p.numel()
+        if "fc3" in name:
+            last_layer_mask[idx : idx + n] = 1.0
+        idx += n
+
+    warmup_protect_episodes = int(0.10 * max_episodes)
+
+    # ==========================================================
+    # Optimization loop
+    # ==========================================================
+    for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
+
+        flat = current_params.clone()
+        progress = episode / max_episodes
+
+        if episode < warmup_protect_episodes:
+            mask = last_layer_mask
+            noise_mult = 0.30
+            K_eval = K_slow
+        elif progress < 0.6:
+            mask = torch.ones_like(flat)
+            noise_mult = 0.90
+            K_eval = K_fast
+        else:
+            mask = last_layer_mask
+            noise_mult = 0.45
+            K_eval = K_slow
+
+        if episode % jump_every == 0 and episode > warmup_protect_episodes:
+            step = torch.randn_like(flat) / (torch.rand_like(flat) ** 0.5 + 1e-8)
+            proposal = flat + noise * 1.2 * step * mask
+        else:
+            proposal = flat + noise * noise_mult * torch.randn_like(flat) * mask
+
+        set_flat_params(policy_net, proposal)
+        clip_params(policy_net)
+
+        cand_reward = evaluate(env, policy_net, K_eval, demand_pool)
+        delta = cand_reward - current_reward
+
+        if episode < 0.3 * max_episodes:
+            accept = delta > -100
+        else:
+            accept = (delta > 0) or (np.random.rand() < np.exp(delta / (T + 1e-8)))
+
+        if accept:
+            current_params = proposal
+            current_reward = cand_reward
+        else:
+            set_flat_params(policy_net, current_params)
+
+        if current_reward > best_reward:
+            best_reward = current_reward
+            best_policy = copy.deepcopy(policy_net.state_dict())
+            best_params = current_params.clone()
+            torch.save(best_policy, save_f_path)
+            noise *= 0.98
+            stagnation_counter = 0
+        else:
+            noise *= 1.01
+            stagnation_counter += 1
+
+        noise = np.clip(noise, 0.01, 0.25)
+        T = max(T * alpha, T_min)
+
+        if stagnation_counter > stagnation_limit:
+            current_params = best_params.clone()
+            set_flat_params(policy_net, current_params)
+            noise = base_noise
+            T = 2.2
+            stagnation_counter = 0
+
+        plot_data["episodes"].append(episode)
+        plot_data["reward_history"].append(best_reward)
+
+        # -----------------------------------------------------------------------------------
+        # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
+        # -----------------------------------------------------------------------------------
+        if (time.time() - start_time) > max_time:
+            break
+
+    # ==========================================================
+    # FINAL LOCAL REFINEMENT PHASE (USES REMAINING TIME BUDGET)
+    # Legal: still only env interaction + torch/numpy; no extra packages.
+    # ==========================================================
+    time_left = max_time - (time.time() - start_time)
+
+    # Spend at most ~60% of remaining time on polishing (keeps margin)
+    refine_budget = max(0.0, 0.60 * time_left)
+
+    if refine_budget > 5.0:  # only if meaningful time remains
+        refine_end = time.time() + refine_budget
+
+        # Start from the best parameters found
+        current_params = best_params.clone()
+        set_flat_params(policy_net, current_params)
+        clip_params(policy_net)
+
+        # Conservative local SA settings
+        refine_noise = 0.02
+        refine_T = 0.40
+        refine_alpha = 0.9992
+
+        # Use more reliable evaluation late
+        refine_K = 10
+
+        # Short fixed batch for stable polishing comparisons
+        # (still sampled from the same pool → no test leakage)
+        local_batch = [demand_pool[i] for i in np.random.randint(0, len(demand_pool), size=refine_K)]
+        current_reward = evaluate(env, policy_net, refine_K, local_batch)
+
+        # Multiple short restarts from best (output-layer only)
+        restart_every = 120
+        it = 0
+
+        while time.time() < refine_end:
+            it += 1
+
+            # small output-layer perturbation only
+            proposal = current_params + refine_noise * torch.randn_like(current_params) * last_layer_mask
+
+            set_flat_params(policy_net, proposal)
+            clip_params(policy_net)
+
+            cand_reward = evaluate(env, policy_net, refine_K, local_batch)
+            d = cand_reward - current_reward
+
+            accept = (d > 0) or (np.random.rand() < np.exp(d / (refine_T + 1e-8)))
+            if accept:
+                current_params = proposal
+                current_reward = cand_reward
+
+                if current_reward > best_reward:
+                    best_reward = current_reward
+                    best_params = current_params.clone()
+                    best_policy = copy.deepcopy(policy_net.state_dict())
+                    torch.save(best_policy, save_f_path)
+
+            else:
+                set_flat_params(policy_net, current_params)
+
+            refine_noise = float(np.clip(refine_noise * 0.9995, 0.006, 0.03))
+            refine_T = max(refine_T * refine_alpha, 0.05)
+
+            # Occasionally refresh the polishing batch a bit (prevents overfitting to one mini-batch)
+            if it % restart_every == 0:
+                local_batch = [demand_pool[i] for i in np.random.randint(0, len(demand_pool), size=refine_K)]
+                set_flat_params(policy_net, best_params.clone())
+                clip_params(policy_net)
+                current_params = best_params.clone()
+                current_reward = evaluate(env, policy_net, refine_K, local_batch)
+
+    print(f"Policy model weights saved in: {save_f_path}")
+    print(f"Best reward: {best_reward}")
+
+    team_names = [
+        "Del Rio Chanona, Antonio",
+        "Fons, Isabela",
+    ]
+    cids = ["16879875", "06069513"]
+    question = [1, 0]
+
+    return best_policy, plot_data
