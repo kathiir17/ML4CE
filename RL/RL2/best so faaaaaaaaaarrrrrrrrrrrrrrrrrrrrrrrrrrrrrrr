@@ -34,39 +34,9 @@ def your_optimization_alg(
     # =========================
     # Helper functions
     # =========================
-    def run_episode(env, policy_net):
-        env.reset()
-        state = env.state
-        done = False
-        total_reward = 0.0
-
-        prev_action = None
-        volatility = 0.0
-
-        while not done:
-            with torch.no_grad():
-                action_mean = policy_net(torch.FloatTensor(state))
-
-            action = np.clip(
-                np.round(action_mean.numpy()),
-                env.action_space.low,
-                env.action_space.high,
-            ).astype(np.int16)
-
-            if prev_action is not None:
-                volatility += np.sum(np.abs(action - prev_action))
-            prev_action = action
-
-            state, reward, done, _ = env.step(action)
-            total_reward += reward
-
-        # volatility penalty (forces stable policies)
-        return float(total_reward - 0.05 * volatility)
-
-    def evaluate(env, policy_net, K):
-        rewards = [run_episode(env, policy_net) for _ in range(K)]
-        # median-based objective (robust > lucky)
-        return float(np.median(rewards))
+    def clip_params(model, max_abs=10.0):
+        for p in model.parameters():
+            p.data.clamp_(-max_abs, max_abs)
 
     def get_flat_params(model):
         return torch.cat([p.data.view(-1) for p in model.parameters()])
@@ -75,20 +45,71 @@ def your_optimization_alg(
         idx = 0
         for p in model.parameters():
             n = p.numel()
-            p.data.copy_(flat[idx:idx + n].view_as(p))
+            p.data.copy_(flat[idx : idx + n].view_as(p))
             idx += n
 
-    def clip_params(model, max_abs=10.0):
-        for p in model.parameters():
-            p.data.clamp_(-max_abs, max_abs)
+    def run_episode(env, policy_net, demand=None):
+        # Fix customer demand (if provided)
+        env.demand_dataset = demand
+        env.reset()
+        state = env.state
+        done = False
+        total_reward = 0.0
+
+        # preallocate tensor (speed)
+        state_tensor = torch.zeros(len(state), dtype=torch.float32)
+
+        prev_action = None
+        volatility = 0.0
+
+        while not done:
+            state_tensor.copy_(torch.from_numpy(state))
+
+            with torch.no_grad():
+                action_mean = policy_net(state_tensor)
+
+            action_np = action_mean.detach().cpu().numpy()
+
+            # guard against NaN/Inf
+            if np.any(np.isnan(action_np)) or np.any(np.isinf(action_np)):
+                return -1e9
+
+            action = np.round(action_np)
+            action = np.clip(action, env.action_space.low, env.action_space.high).astype(
+                np.int16
+            )
+
+            if prev_action is not None:
+                volatility += float(np.sum(np.abs(action - prev_action)))
+            prev_action = action
+
+            state, reward, done, _ = env.step(action)
+            total_reward += reward
+
+        # small stability penalty (don’t overdo it)
+        return float(total_reward - 0.02 * volatility)
+
+    def evaluate_on_demands(env, policy_net, demands):
+        vals = np.array([run_episode(env, policy_net, demand=d) for d in demands], dtype=np.float64)
+        # trimmed mean (robust but not overly conservative like median)
+        vals.sort()
+        if len(vals) >= 6:
+            k = max(1, int(0.20 * len(vals)))
+            return float(np.mean(vals[k:-k]))
+        return float(np.mean(vals))
+
+    def evaluate(env, policy_net, K, demand_pool):
+        idx = np.random.randint(0, len(demand_pool), size=K)
+        batch = [demand_pool[i] for i in idx]
+        return evaluate_on_demands(env, policy_net, batch)
 
     # =========================
-    # WARM-UP (LEGAL): imitate an (s,S)-style teacher for a few seconds
+    # WARM-UP (LEGAL): imitate an (s,S)-style teacher briefly
     # =========================
     capacities = np.array(
-        [r.order_quantity_limit for r in env.retailers] +
-        [dc.order_quantity_limit for dc in env.DCs],
-        dtype=np.float32
+        [r.order_quantity_limit for r in env.retailers]
+        + [dc.order_quantity_limit for dc in env.DCs],
+        dtype=np.float32,
     )
     s_teacher = capacities / 3.0
     S_teacher = capacities
@@ -99,8 +120,6 @@ def your_optimization_alg(
         for i in range(len(inv_pos)):
             if inv_pos[i] <= s_teacher[i]:
                 act[i] = min(S_teacher[i] - inv_pos[i], capacities[i])
-            else:
-                act[i] = 0.0
         return act
 
     warmup_seconds = 8.0
@@ -110,19 +129,15 @@ def your_optimization_alg(
     while time.time() < warmup_end:
         env.reset()
         done = False
-        while not done and time.time() < warmup_end:
+        while (not done) and time.time() < warmup_end:
             s = env.state.copy()
             a = teacher_action(s)
-
             X_buf.append(s.astype(np.float32))
             Y_buf.append(a.astype(np.float32))
 
             a_int = np.clip(
-                np.round(a),
-                env.action_space.low,
-                env.action_space.high
+                np.round(a), env.action_space.low, env.action_space.high
             ).astype(np.int16)
-
             _, _, done, _ = env.step(a_int)
 
     if len(X_buf) >= 256:
@@ -131,14 +146,15 @@ def your_optimization_alg(
 
         opt = torch.optim.Adam(policy_net.parameters(), lr=3e-4)
         loss_fn = torch.nn.SmoothL1Loss()
+
         batch_size = 128
         n = X.shape[0]
         idxs = np.arange(n)
 
-        for _ in range(5):
+        for _ in range(6):
             np.random.shuffle(idxs)
             for j in range(0, n, batch_size):
-                b = idxs[j:j + batch_size]
+                b = idxs[j : j + batch_size]
                 pred = policy_net(X[b])
                 loss = loss_fn(pred, Y[b])
                 opt.zero_grad()
@@ -146,9 +162,10 @@ def your_optimization_alg(
                 torch.nn.utils.clip_grad_norm_(policy_net.parameters(), 1.0)
                 opt.step()
 
-        # light output-bias calibration (helps match teacher scale)
+        # light output bias calibration to match teacher scale
         with torch.no_grad():
-            pred = policy_net(X[:512]).cpu().numpy()
+            Xs = X[:512]
+            pred = policy_net(Xs).cpu().numpy()
             tgt = Y[:512].cpu().numpy()
             delta_bias = (tgt.mean(axis=0) - pred.mean(axis=0)).astype(np.float32)
             for name, p in policy_net.named_parameters():
@@ -158,103 +175,152 @@ def your_optimization_alg(
     clip_params(policy_net)
 
     # =========================
-    # Simulated Annealing setup
+    # Simulated Annealing setup (improved, still SA, still legal)
     # =========================
-    T = 2.5
-    T_min = 1e-3
-    alpha = 0.9985
+    T = 2.2
+    T_min = 5e-4
+    alpha = 0.9988
 
-    noise = 0.12
-    base_noise = noise
+    base_noise = 0.10
+    noise = base_noise
 
     K_fast = 2
-    K_slow = 6
+    K_slow = 7  # slightly more reliable than 6 (budget allows)
 
-    stagnation_limit = 300
-    jump_every = 25
+    stagnation_limit = 260
+    jump_every = 120  # less disruptive than 25; warm-start friendly
+
+    # fixed demand pool (common random numbers)
+    pool_size = 10
+    demand_pool = []
+    for _ in range(pool_size):
+        dem, _ = env.sample_demands_episode()
+        demand_pool.append(dem)
+
+    refresh_every = 120  # occasional refresh to avoid overfitting
+
+    # EMA scoring (reduces evaluation noise without killing performance)
+    ema_beta = 0.10
 
     current_params = get_flat_params(policy_net)
-    current_reward = evaluate(env, policy_net, K_slow)
+    current_reward = evaluate(env, policy_net, K_slow, demand_pool)
+    current_ema = current_reward
+    best_ema = current_ema
 
     best_reward = current_reward
-    best_params = current_params.clone()
     best_policy = copy.deepcopy(policy_net.state_dict())
+    best_params = current_params.clone()
     torch.save(best_policy, save_f_path)
 
     stagnation_counter = 0
 
     # =========================
-    # Last-layer mask
+    # Last-layer mask + layer scale (encourage sharper (s,S)-like decisions)
     # =========================
     flat_dim = current_params.numel()
     last_layer_mask = torch.zeros(flat_dim)
+    scale = torch.ones(flat_dim)
 
     idx = 0
     for name, p in policy_net.named_parameters():
         n = p.numel()
         if "fc3" in name:
-            last_layer_mask[idx:idx + n] = 1.0
+            last_layer_mask[idx : idx + n] = 1.0
+            scale[idx : idx + n] = 1.6
+        elif "fc2" in name:
+            scale[idx : idx + n] = 1.0
+        else:
+            scale[idx : idx + n] = 0.8
         idx += n
+
+    warmup_protect_episodes = min(200, int(0.10 * max_episodes))
 
     # =========================
     # Optimization loop
     # =========================
     for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
 
+        # refresh one scenario occasionally
+        if episode % refresh_every == 0 and episode > 0:
+            j = np.random.randint(0, pool_size)
+            dem, _ = env.sample_demands_episode()
+            demand_pool[j] = dem
+
         flat = current_params.clone()
         progress = episode / max_episodes
 
-        # exploration → exploitation
-        if progress < 0.6:
+        # phase schedule
+        if episode < warmup_protect_episodes:
+            mask = last_layer_mask
+            noise_mult = 0.25
+            K_eval = K_slow
+        elif progress < 0.55:
             mask = torch.ones_like(flat)
+            noise_mult = 0.85
+            K_eval = K_fast
         else:
             mask = last_layer_mask
-            noise = min(noise, 0.06)
+            noise_mult = 0.45
+            K_eval = K_slow
 
-        # proposal
-        if episode % jump_every == 0:
+        # proposals (rare Levy jump)
+        if (episode % jump_every == 0) and (episode > warmup_protect_episodes) and (episode > 0):
             step = torch.randn_like(flat) / (torch.rand_like(flat) ** 0.5 + 1e-8)
-            proposal = flat + noise * step
+            proposal = flat + noise * 1.2 * step * scale * mask
         else:
-            proposal = flat + noise * torch.randn_like(flat) * mask
+            proposal = flat + noise * noise_mult * torch.randn_like(flat) * scale * mask
 
         set_flat_params(policy_net, proposal)
-        clipclip_params(policy_net)  # (keep weights bounded)
+        clip_params(policy_net)
 
-        K_eval = K_fast if progress < 0.6 else K_slow
-        candidate_reward = evaluate(env, policy_net, K_eval)
+        candidate_fast = evaluate(env, policy_net, K_eval, demand_pool)
+        # confirm only when fast eval is used and looks decent
+        if (K_eval == K_fast) and (candidate_fast >= current_reward - 250):
+            candidate_reward = evaluate(env, policy_net, K_slow, demand_pool)
+        else:
+            candidate_reward = candidate_fast
 
-        delta = candidate_reward - current_reward
+        candidate_ema = (1.0 - ema_beta) * current_ema + ema_beta * candidate_reward
+        delta = candidate_ema - current_ema
 
-        if delta > 0 or np.random.rand() < np.exp(delta / (T + 1e-8)):
+        # early: allow slight downhill (prevents getting stuck), but not too much
+        if episode < int(0.30 * max_episodes):
+            accepted = (delta > -120.0)
+        else:
+            accepted = (delta > 0.0) or (np.random.rand() < np.exp(delta / (T + 1e-8)))
+
+        if accepted:
             current_params = proposal
             current_reward = candidate_reward
+            current_ema = candidate_ema
         else:
             set_flat_params(policy_net, current_params)
 
         if current_reward > best_reward:
             best_reward = current_reward
+            best_ema = max(best_ema, current_ema)
             best_params = current_params.clone()
             best_policy = copy.deepcopy(policy_net.state_dict())
             torch.save(best_policy, save_f_path)
             stagnation_counter = 0
-            noise *= 0.97
+            noise *= 0.985
         else:
             stagnation_counter += 1
-            noise *= 1.01
+            noise *= 1.005
 
-        noise = np.clip(noise, 0.03, 0.35)
+        noise = float(np.clip(noise, 0.01, 0.25))
         T = max(T * alpha, T_min)
 
-        # elite restart
+        # reheat + restart from best if stuck
         if stagnation_counter > stagnation_limit:
-            T = 2.5
+            T = 2.2
             noise = base_noise
             stagnation_counter = 0
-            current_params = best_params + 0.02 * torch.randn_like(best_params) * last_layer_mask
+            current_params = best_params.clone() + 0.01 * torch.randn_like(best_params) * last_layer_mask
             set_flat_params(policy_net, current_params)
             clip_params(policy_net)
-            current_reward = evaluate(env, policy_net, K_slow)
+            current_reward = evaluate(env, policy_net, K_slow, demand_pool)
+            current_ema = current_reward
 
         plot_data["episodes"].append(episode)
         plot_data["reward_history"].append(best_reward)
@@ -264,6 +330,63 @@ def your_optimization_alg(
         # -----------------------------------------------------------------------------------
         if (time.time() - start_time) > max_time:
             break
+
+    # =========================
+    # FINAL LOCAL REFINEMENT (use remaining time budget safely)
+    # =========================
+    time_left = max_time - (time.time() - start_time)
+    refine_budget = max(0.0, 0.60 * time_left)
+
+    if refine_budget > 6.0:
+        refine_end = time.time() + refine_budget
+
+        # start from the best
+        current_params = best_params.clone()
+        set_flat_params(policy_net, current_params)
+        clip_params(policy_net)
+
+        refine_noise = 0.02
+        refine_T = 0.40
+        refine_alpha = 0.9992
+        refine_K = 10  # more reliable late (budget allows)
+
+        # stable mini-batch from the training pool
+        local_batch = [demand_pool[i] for i in np.random.randint(0, len(demand_pool), size=refine_K)]
+        current_reward = evaluate_on_demands(env, policy_net, local_batch)
+
+        it = 0
+        while time.time() < refine_end:
+            it += 1
+
+            proposal = current_params + refine_noise * torch.randn_like(current_params) * last_layer_mask
+            set_flat_params(policy_net, proposal)
+            clip_params(policy_net)
+
+            cand_reward = evaluate_on_demands(env, policy_net, local_batch)
+            d = cand_reward - current_reward
+
+            if (d > 0.0) or (np.random.rand() < np.exp(d / (refine_T + 1e-8))):
+                current_params = proposal
+                current_reward = cand_reward
+
+                if current_reward > best_reward:
+                    best_reward = current_reward
+                    best_params = current_params.clone()
+                    best_policy = copy.deepcopy(policy_net.state_dict())
+                    torch.save(best_policy, save_f_path)
+            else:
+                set_flat_params(policy_net, current_params)
+
+            refine_noise = float(np.clip(refine_noise * 0.9995, 0.006, 0.03))
+            refine_T = max(refine_T * refine_alpha, 0.05)
+
+            # refresh local batch occasionally
+            if it % 140 == 0:
+                local_batch = [demand_pool[i] for i in np.random.randint(0, len(demand_pool), size=refine_K)]
+                set_flat_params(policy_net, best_params.clone())
+                clip_params(policy_net)
+                current_params = best_params.clone()
+                current_reward = evaluate_on_demands(env, policy_net, local_batch)
 
     print(f"Policy model weights saved in: {save_f_path}")
     print(f"Best reward: {best_reward}")
@@ -276,3 +399,4 @@ def your_optimization_alg(
     question = [1, 0]
 
     return best_policy, plot_data
+
