@@ -1,0 +1,812 @@
+"""
+overnight_mlce_study.py
+
+Purpose
+Run an 8 hour style experiment that
+1 compares a small set of targeted BO modifications
+2 logs every evaluation
+3 quantifies early run signatures that predict strong final outcomes
+4 produces an actionable report aimed at lifting avg best toward 350 and avg cum@15 toward 4000
+
+Timing model
+One evaluation is about 10 seconds.
+Each run does 6 init + 15*5 batch = 81 evals -> about 810 seconds simulator time.
+With GP overhead expect about 14 to 16 min per run.
+8 hours should fit roughly 28 to 34 runs. This script uses a wall clock budget and stops cleanly.
+
+Outputs created in overnight_outputs
+runs_log.csv        one row per run
+eval_log.csv        one row per evaluation
+report.txt          key findings and next actions
+plots/*.png         quick diagnostics
+
+How to run
+python overnight_mlce_study.py
+
+Requirements
+numpy scipy matplotlib pandas sobol_seq
+same virtual_lab path you already use
+"""
+
+import os
+import time
+import json
+import random
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+import sys
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+
+def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(
+        virtual_lab.conduct_experiment(X, initial_conditions=custom_init)
+    )
+
+
+bounds = np.array([[30, 40], [6, 8], [0, 50], [0, 50], [0, 50]], dtype=float)
+celltypes = ["celltype_1", "celltype_2", "celltype_3"]
+
+
+def clip_x(x):
+    t, pH, f1, f2, f3, ct = x
+    t = float(np.clip(t, bounds[0, 0], bounds[0, 1]))
+    pH = float(np.clip(pH, bounds[1, 0], bounds[1, 1]))
+    f1 = float(np.clip(f1, bounds[2, 0], bounds[2, 1]))
+    f2 = float(np.clip(f2, bounds[3, 0], bounds[3, 1]))
+    f3 = float(np.clip(f3, bounds[4, 0], bounds[4, 1]))
+    if ct not in celltypes:
+        ct = "celltype_3"
+    return [t, pH, f1, f2, f3, ct]
+
+
+def encode_point(x):
+    t, pH, f1, f2, f3, ct = x
+    cont = [(t - 30) / 10, (pH - 6) / 2, f1 / 50, f2 / 50, f3 / 50]
+    cat = [1 if ct == c else 0 for c in celltypes]
+    return np.array(cont + cat, dtype=float)
+
+
+def encode_batch(X):
+    return np.vstack([encode_point(x) for x in X])
+
+
+class GP:
+    def __init__(self):
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+        self._bounds = [
+            (-3.0, 2.0),
+            (-3.0, 2.0),
+            (-3.0, 3.0),
+            (-15.0, -1.0),
+        ]
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5] / lc, A[:, 5:] / lk
+        B1, B2 = B[:, :5] / lc, B[:, 5:] / lk
+
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2 * A1 @ B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2 * A2 @ B2.T
+        sq = np.maximum(sq, 0)
+
+        d = np.sqrt(sq)
+        sd = np.sqrt(5) * d
+        return s2 * (1 + sd + 5 * d * d / 3) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2 * ls))
+        jitter = 1e-8 + 1e-6 * np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2 * ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = (
+                0.5 * self.y @ alpha
+                + np.sum(np.log(np.diag(L)))
+                + 0.5 * len(self.y) * np.log(2 * np.pi)
+            )
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def fit(self, X, y, optimise=True):
+        self.X = X
+
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            res = minimize(
+                self.neg_log_mll,
+                self.theta,
+                method="L-BFGS-B",
+                bounds=self._bounds
+            )
+            self.theta = res.x
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2 * ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2 * ls) - np.sum(Kxs * v.T, axis=1)
+        return mu * self.s + self.m, np.sqrt(np.maximum(var, 1e-12)) * self.s
+
+
+def expected_improvement(mu, sigma, best, xi):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+
+def make_init_with_offset(n=6, sobol_offset=0, sobol_stride=1):
+    X = []
+    for i in range(n):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * i)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[i % 3]])
+    return X
+
+
+def make_pool_balanced(n_total=3000, sobol_offset=100, sobol_stride=1):
+    per = n_total // 3
+    X = []
+
+    for ct_idx, ct in enumerate(celltypes):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+            X.append([*c, ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        idx = 3 * per + r
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([*c, celltypes[r % 3]])
+
+    return X
+
+
+@dataclass
+class Variant:
+    name: str
+
+    N_MIN_OPT: int = 15
+    UCB_KAPPA: float = 1.0
+    UCB_PICKS: int = 2
+    DIV_WEIGHT: float = 0.3
+
+    xi_mode: str = "best_real"
+    xi_constant: float = 0.02
+    xi_decay_start: float = 0.05
+    xi_decay_final: float = 0.005
+
+    local_probe: bool = False
+    local_probe_points: int = 2
+    local_probe_radius_frac: float = 0.08
+
+    replicate_elite: bool = False
+    replicate_threshold: float = 380.0
+    replicate_points: int = 1
+
+    force_celltype_coverage_iters: int = 0
+
+    use_elite_bank_in_pool: bool = True
+    elite_bank_pool_points_per_ct: int = 30
+    use_elite_bank_in_init: bool = False
+    elite_bank_init_points: int = 2
+
+    pool_size: int = 3000
+
+
+VARIANTS: List[Variant] = [
+    Variant(name="baseline"),
+    Variant(name="xi_constant_0p02", xi_mode="constant", xi_constant=0.02),
+    Variant(name="local_probe", local_probe=True, local_probe_points=2, local_probe_radius_frac=0.08),
+    Variant(name="replicate_plus_probe", local_probe=True, replicate_elite=True, replicate_threshold=380.0, replicate_points=1),
+    Variant(name="celltype_coverage_1", force_celltype_coverage_iters=1),
+    Variant(name="coverage_1_plus_probe", force_celltype_coverage_iters=1, local_probe=True, local_probe_points=2),
+    Variant(name="xi_decay_plus_probe", xi_mode="decay", xi_decay_start=0.06, xi_decay_final=0.006, local_probe=True, local_probe_points=2),
+    Variant(name="bigger_pool_6000", pool_size=6000, local_probe=True, local_probe_points=2),
+]
+
+
+class EliteBank:
+    def __init__(self, max_points_per_ct=200):
+        self.max_points_per_ct = max_points_per_ct
+        self.store: Dict[str, List[Tuple[float, List[Any]]]] = {ct: [] for ct in celltypes}
+
+    def add(self, x: List[Any], y: float):
+        ct = x[-1]
+        if ct not in self.store:
+            return
+        self.store[ct].append((float(y), list(x)))
+        self.store[ct].sort(key=lambda t: t[0], reverse=True)
+        self.store[ct] = self.store[ct][:self.max_points_per_ct]
+
+    def top(self, ct: str, n: int) -> List[List[Any]]:
+        if ct not in self.store:
+            return []
+        return [p for _, p in self.store[ct][:n]]
+
+    def has_any(self) -> bool:
+        return any(len(v) > 0 for v in self.store.values())
+
+
+class BO:
+    def __init__(self, X_init, X_pool, iters, batch, variant: Variant):
+        self.variant = variant
+
+        self.N_MIN_OPT = variant.N_MIN_OPT
+        self.UCB_KAPPA = variant.UCB_KAPPA
+        self.UCB_PICKS = variant.UCB_PICKS
+        self.DIV_WEIGHT = variant.DIV_WEIGHT
+
+        self.pool = X_pool
+        self.enc_pool = encode_batch(X_pool)
+        self.taken = np.zeros(len(X_pool), bool)
+
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        self.batch_best: List[float] = []
+        self.xi_values: List[float] = []
+        self.eval_log: List[Dict[str, Any]] = []
+
+        for i, x in enumerate(self.X_obs):
+            self.eval_log.append({
+                "eval_index": i,
+                "phase": "init",
+                "t": float(x[0]),
+                "pH": float(x[1]),
+                "f1": float(x[2]),
+                "f2": float(x[3]),
+                "f3": float(x[4]),
+                "celltype": str(x[5]),
+                "y": float(self.Y[i]),
+                "is_local_probe": 0,
+                "is_replicate": 0,
+            })
+
+        self.gp = GP()
+        self.gp.fit(encode_batch(self.X_obs), np.array(self.Y, dtype=float), optimise=False)
+
+        eval_index = len(self.X_obs)
+        current_best_x: Optional[List[Any]] = None
+        current_best_y = float(np.max(self.Y))
+
+        for batch_num in range(1, iters + 1):
+            fake_X: List[List[Any]] = []
+            fake_Y: List[float] = []
+            fake_flags: List[Tuple[int, int]] = []
+            local_probe_used = 0
+            replicate_used = 0
+
+            best_real = float(np.max(self.Y))
+
+            if variant.xi_mode == "best_real":
+                xi_val = float(np.clip(0.2 * np.exp(-0.05 * best_real / 10.0), 0.01, 0.3))
+            elif variant.xi_mode == "constant":
+                xi_val = float(variant.xi_constant)
+            elif variant.xi_mode == "decay":
+                frac = (batch_num - 1) / max(1, iters - 1)
+                xi_val = float(variant.xi_decay_start * (1.0 - frac) + variant.xi_decay_final * frac)
+            else:
+                xi_val = 0.02
+
+            self.xi_values.append(xi_val)
+
+            for pick_idx in range(batch):
+                use_local_probe = False
+                use_replicate = False
+
+                if variant.replicate_elite and (current_best_x is not None) and (current_best_y >= variant.replicate_threshold):
+                    if replicate_used < variant.replicate_points and pick_idx == 0:
+                        use_replicate = True
+
+                if (not use_replicate) and variant.local_probe and (current_best_x is not None):
+                    if local_probe_used < variant.local_probe_points:
+                        use_local_probe = True
+
+                if use_replicate:
+                    x_new = list(current_best_x)
+                    replicate_used += 1
+                    pick_is_rep = 1
+                    pick_is_lp = 0
+
+                elif use_local_probe:
+                    x_new = self._sample_near(current_best_x, variant.local_probe_radius_frac, prefer_ct=None)
+                    local_probe_used += 1
+                    pick_is_rep = 0
+                    pick_is_lp = 1
+
+                else:
+                    mu, std = self.gp.predict(self.enc_pool)
+                    best = float(np.max(self.Y + fake_Y))
+
+                    if (batch_num == 1) and (pick_idx < self.UCB_PICKS):
+                        mu_eff = mu + self.UCB_KAPPA * std
+                    else:
+                        mu_eff = mu
+
+                    ei = expected_improvement(mu_eff, std, best, xi=xi_val)
+
+                    if len(fake_X) > 0:
+                        enc_fake = encode_batch(fake_X)
+                        diff = self.enc_pool[:, None, :] - enc_fake[None, :, :]
+                        dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                        ei = ei * (1.0 + self.DIV_WEIGHT * dist)
+
+                    ei[self.taken] = -np.inf
+
+                    if variant.force_celltype_coverage_iters > 0 and batch_num <= variant.force_celltype_coverage_iters:
+                        missing = set(celltypes) - set([x[-1] for x in fake_X])
+                        if len(missing) > 0 and pick_idx < 3:
+                            allowed = np.array(
+                                [True if self.pool[i][-1] in missing else False for i in range(len(self.pool))],
+                                dtype=bool
+                            )
+                            ei[~allowed] = -np.inf
+
+                    idx = int(np.argmax(ei))
+                    self.taken[idx] = True
+                    x_new = list(self.pool[idx])
+                    pick_is_rep = 0
+                    pick_is_lp = 0
+
+                fake_X.append(x_new)
+                fake_flags.append((pick_is_lp, pick_is_rep))
+
+                mu_fake, _ = self.gp.predict(encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                self.gp.fit(
+                    encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            Y_real = objective_func(fake_X)
+
+            self.batch_best.append(float(np.max(Y_real)))
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+
+            for j, x in enumerate(fake_X):
+                yj = float(Y_real[j])
+                is_lp, is_rep = fake_flags[j]
+                self.eval_log.append({
+                    "eval_index": eval_index,
+                    "phase": f"batch_{batch_num}",
+                    "t": float(x[0]),
+                    "pH": float(x[1]),
+                    "f1": float(x[2]),
+                    "f2": float(x[3]),
+                    "f3": float(x[4]),
+                    "celltype": str(x[5]),
+                    "y": yj,
+                    "is_local_probe": int(is_lp),
+                    "is_replicate": int(is_rep),
+                })
+                eval_index += 1
+
+            new_best_y = float(np.max(self.Y))
+            if new_best_y > current_best_y:
+                current_best_y = new_best_y
+                best_idx = int(np.argmax(np.array(self.Y, dtype=float)))
+                current_best_x = list(self.X_obs[best_idx])
+
+            optimise_now = (len(self.Y) >= self.N_MIN_OPT)
+            self.gp.fit(encode_batch(self.X_obs), np.array(self.Y, dtype=float), optimise=optimise_now)
+
+    def _sample_near(self, x_center: List[Any], radius_frac: float, prefer_ct: Optional[str]) -> List[Any]:
+        t, pH, f1, f2, f3, ct = x_center
+        span = bounds[:, 1] - bounds[:, 0]
+        r = radius_frac * span
+        t2 = t + random.uniform(-r[0], r[0])
+        pH2 = pH + random.uniform(-r[1], r[1])
+        f12 = f1 + random.uniform(-r[2], r[2])
+        f22 = f2 + random.uniform(-r[3], r[3])
+        f32 = f3 + random.uniform(-r[4], r[4])
+        ct2 = prefer_ct if prefer_ct in celltypes else ct
+        return clip_x([t2, pH2, f12, f22, f32, ct2])
+
+
+def running_best_from_batch_best(bb: np.ndarray) -> np.ndarray:
+    out = np.empty_like(bb, dtype=float)
+    best = -1e18
+    for i, v in enumerate(bb):
+        if v > best:
+            best = v
+        out[i] = best
+    return out
+
+
+def cum15_from_batch_best(bb: np.ndarray) -> float:
+    rb = running_best_from_batch_best(bb)
+    return float(np.sum(rb))
+
+
+def eval_index_of_first_hit(y: np.ndarray, thr: float) -> int:
+    idx = np.where(y >= thr)[0]
+    return int(idx[0]) if len(idx) else -1
+
+
+def early_features(eval_df: pd.DataFrame, k: int) -> Dict[str, float]:
+    sub = eval_df.iloc[:k].copy()
+    y = sub["y"].to_numpy(dtype=float)
+    feats: Dict[str, float] = {}
+    feats[f"early_best_{k}"] = float(np.nanmax(y))
+    feats[f"early_mean_{k}"] = float(np.nanmean(y))
+    feats[f"early_lowcount_{k}"] = float(np.sum(y <= 2.0))
+    ct_counts = sub["celltype"].value_counts(normalize=True)
+    for ct in celltypes:
+        feats[f"early_frac_{ct}_{k}"] = float(ct_counts.get(ct, 0.0))
+    feats[f"early_unique_ct_{k}"] = float(sub["celltype"].nunique())
+    X = sub[["t", "pH", "f1", "f2", "f3"]].to_numpy(dtype=float)
+    step = np.linalg.norm(np.diff(X, axis=0), axis=1)
+    feats[f"early_step_mean_{k}"] = float(np.mean(step)) if len(step) else 0.0
+    return feats
+
+
+OUT_DIR = "overnight_outputs"
+PLOT_DIR = os.path.join(OUT_DIR, "plots")
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+WALL_CLOCK_HOURS = 8.0
+WALL_CLOCK_SECONDS = int(WALL_CLOCK_HOURS * 3600)
+
+ITERS = 15
+BATCH = 5
+N_INIT = 6
+EVALS_PER_RUN = N_INIT + ITERS * BATCH
+
+ELITE_THR = 330.0
+EARLY_K = [16, 31, 46]
+
+
+def build_pool_and_init(base: int, variant: Variant, bank: EliteBank) -> Tuple[List[List[Any]], List[List[Any]]]:
+    stride_pool = random.choice([1, 3, 5, 7, 9])
+    stride_init = random.choice([1, 3, 5, 7, 9])
+    init_offset = base
+    pool_offset = base + 10_000
+
+    X_pool = make_pool_balanced(n_total=variant.pool_size, sobol_offset=pool_offset, sobol_stride=stride_pool)
+    X_init = make_init_with_offset(n=N_INIT, sobol_offset=init_offset, sobol_stride=stride_init)
+
+    if bank.has_any() and variant.use_elite_bank_in_pool:
+        injected: List[List[Any]] = []
+        for ct in celltypes:
+            top_pts = bank.top(ct, variant.elite_bank_pool_points_per_ct)
+            injected.extend([list(p) for p in top_pts])
+
+            n_jitter = max(0, variant.elite_bank_pool_points_per_ct // 3)
+            for p in top_pts[:n_jitter]:
+                t, pH, f1, f2, f3, ct0 = p
+                span = bounds[:, 1] - bounds[:, 0]
+                r = 0.04 * span
+                for _ in range(2):
+                    q = clip_x([
+                        t + random.uniform(-r[0], r[0]),
+                        pH + random.uniform(-r[1], r[1]),
+                        f1 + random.uniform(-r[2], r[2]),
+                        f2 + random.uniform(-r[3], r[3]),
+                        f3 + random.uniform(-r[4], r[4]),
+                        ct0
+                    ])
+                    injected.append(q)
+
+        if len(injected) > 0:
+            X_pool = (injected + X_pool)[:variant.pool_size]
+
+    if bank.has_any() and variant.use_elite_bank_in_init:
+        init_inj: List[List[Any]] = []
+        per_ct = max(1, variant.elite_bank_init_points // 3)
+        for ct in celltypes:
+            init_inj.extend(bank.top(ct, per_ct))
+        init_inj = init_inj[:variant.elite_bank_init_points]
+        X_init = (init_inj + X_init)[:N_INIT]
+
+    return X_pool, X_init
+
+
+def make_report(runs_df: pd.DataFrame, eval_df: pd.DataFrame):
+    path = os.path.join(OUT_DIR, "report.txt")
+    ok = runs_df[runs_df["status"] == "ok"].copy()
+    lines: List[str] = []
+
+    if len(ok) == 0:
+        with open(path, "w", encoding="utf8") as f:
+            f.write("No successful runs\n")
+        return
+
+    lines.append("Summary by variant\n")
+    grp = (
+        ok.groupby("variant", as_index=False)
+          .agg(
+              n=("run_id", "count"),
+              avg_best=("best", "mean"),
+              std_best=("best", "std"),
+              avg_cum15=("cum15", "mean"),
+              std_cum15=("cum15", "std"),
+              avg_first330=("first_hit_330_eval",
+                           lambda s: float(np.mean([v for v in s.values if v >= 0]))
+                           if np.any(s.values >= 0) else -1.0),
+              hit_rate_330=("first_hit_330_eval",
+                            lambda s: float(np.mean([1.0 if v >= 0 else 0.0 for v in s.values]))),
+          )
+          .sort_values("avg_best", ascending=False)
+    )
+    lines.append(grp.to_string(index=False))
+    lines.append("\n")
+
+    overall_best = float(ok["best"].mean())
+    overall_cum = float(ok["cum15"].mean())
+    lines.append("Overall\n")
+    lines.append(f"runs {len(ok)}\n")
+    lines.append(f"avg_best {overall_best:.3f}\n")
+    lines.append(f"avg_cum15 {overall_cum:.3f}\n")
+    lines.append("\n")
+
+    lines.append("Early vs late elite discovery\n")
+    first = ok["first_hit_330_eval"].to_numpy(dtype=float)
+    early_mask = (first >= 0) & (first <= 31)
+    late_mask = (first > 31)
+    none_mask = (first < 0)
+
+    def summarize_subset(name: str, mask: np.ndarray) -> str:
+        if np.sum(mask) == 0:
+            return f"{name}: n=0\n"
+        return (
+            f"{name}: n={int(np.sum(mask))} "
+            f"avg_best={float(ok.loc[mask, 'best'].mean()):.2f} "
+            f"avg_cum15={float(ok.loc[mask, 'cum15'].mean()):.2f}\n"
+        )
+
+    lines.append(summarize_subset("early_hit_330", early_mask))
+    lines.append(summarize_subset("late_hit_330", late_mask))
+    lines.append(summarize_subset("no_hit_330", none_mask))
+    lines.append("\n")
+
+    feat_cols = [c for c in ok.columns if c.startswith("early_")]
+    if len(feat_cols) > 0:
+        corr_best = ok[feat_cols + ["best"]].corr(numeric_only=True)["best"].drop("best").sort_values(ascending=False)
+        corr_cum = ok[feat_cols + ["cum15"]].corr(numeric_only=True)["cum15"].drop("cum15").sort_values(ascending=False)
+        lines.append("Top correlations with best\n")
+        lines.append(corr_best.head(15).to_string())
+        lines.append("\n")
+        lines.append("Top correlations with cum15\n")
+        lines.append(corr_cum.head(15).to_string())
+        lines.append("\n")
+
+    top_variant = str(grp.iloc[0]["variant"])
+    lines.append("Actionable next steps\n")
+    lines.append(f"1 Set default to top variant from this overnight run: {top_variant}\n")
+
+    probe_rows = grp[grp["variant"].str.contains("probe", na=False)]
+    if len(probe_rows) > 0:
+        lines.append("2 If local_probe variants rank near the top, keep it permanently and increase probe points from 2 to 3\n")
+        lines.append("   Rationale converts one off spikes into sustained batch best improvements, raising cum15\n")
+
+    rep_rows = grp[grp["variant"].str.contains("replicate", na=False)]
+    if len(rep_rows) > 0:
+        lines.append("3 If replicate_plus_probe improves avg_best but hurts cum15, keep replication only above a higher threshold like 395\n")
+        lines.append("   Rationale avoid wasting evaluations replicating mediocre points\n")
+
+    cov_rows = grp[grp["variant"].str.contains("coverage", na=False)]
+    if len(cov_rows) > 0:
+        lines.append("4 If coverage variants increase hit_rate_330 and reduce early_lowcount, keep coverage for batch 1 only\n")
+        lines.append("   Rationale coverage is mainly about avoiding early collapse runs\n")
+
+    big_pool_rows = grp[grp["variant"].str.contains("6000", na=False)]
+    if len(big_pool_rows) > 0:
+        lines.append("5 If bigger_pool improves avg_best, keep pool_size 6000 but cap candidate evaluation overhead by caching enc_pool\n")
+
+    lines.append("6 Regardless of variant, keep elite bank injection in pool\n")
+    lines.append("   Rationale you already observed feasible 400+ outcomes, so reusing elite structure should lift averages fast\n")
+    lines.append("\n")
+
+    with open(path, "w", encoding="utf8") as f:
+        f.write("".join(lines))
+
+
+def make_plots(runs_df: pd.DataFrame, eval_df: pd.DataFrame):
+    ok = runs_df[runs_df["status"] == "ok"].copy()
+    if len(ok) == 0:
+        return
+
+    plt.figure()
+    ok.boxplot(column="best", by="variant", rot=45)
+    plt.suptitle("")
+    plt.title("best by variant")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, "box_best.png"), dpi=180)
+    plt.close()
+
+    plt.figure()
+    ok.boxplot(column="cum15", by="variant", rot=45)
+    plt.suptitle("")
+    plt.title("cum15 by variant")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, "box_cum15.png"), dpi=180)
+    plt.close()
+
+    plt.figure()
+    plt.scatter(ok["best"], ok["cum15"])
+    plt.xlabel("best")
+    plt.ylabel("cum15")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, "scatter_best_vs_cum15.png"), dpi=180)
+    plt.close()
+
+    curves = []
+    for (variant, run_id), sub in eval_df.groupby(["variant", "run_id"]):
+        sub2 = sub.sort_values("eval_index")
+        y = sub2["y"].to_numpy(dtype=float)
+        rb = np.maximum.accumulate(y)
+        for i in range(len(rb)):
+            curves.append({
+                "variant": variant,
+                "eval_index": int(sub2.iloc[i]["eval_index"]),
+                "rb": float(rb[i])
+            })
+    curves_df = pd.DataFrame(curves)
+
+    plt.figure()
+    for variant, sub in curves_df.groupby("variant"):
+        m = sub.groupby("eval_index")["rb"].mean()
+        plt.plot(m.index.to_numpy(dtype=int), m.to_numpy(dtype=float), label=str(variant))
+    plt.xlabel("eval_index")
+    plt.ylabel("mean running best")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOT_DIR, "mean_running_best_by_variant.png"), dpi=180)
+    plt.close()
+
+
+def main():
+    meta = {
+        "started": time.strftime("%Y%m%d_%H%M%S"),
+        "wall_clock_hours": WALL_CLOCK_HOURS,
+        "evals_per_run": EVALS_PER_RUN,
+        "iters": ITERS,
+        "batch": BATCH,
+        "variants": [asdict(v) for v in VARIANTS],
+    }
+    with open(os.path.join(OUT_DIR, "meta.json"), "w", encoding="utf8") as f:
+        json.dump(meta, f, indent=2)
+
+    bank = EliteBank(max_points_per_ct=250)
+
+    run_rows: List[Dict[str, Any]] = []
+    eval_rows: List[Dict[str, Any]] = []
+
+    start = time.time()
+    deadline = start + WALL_CLOCK_SECONDS
+
+    run_id = 0
+    vidx = 0
+
+    while time.time() < deadline:
+        run_id += 1
+        variant = VARIANTS[vidx]
+        vidx = (vidx + 1) % len(VARIANTS)
+
+        base = random.randint(0, 50_000)
+        X_pool, X_init = build_pool_and_init(base, variant, bank)
+
+        t0 = time.time()
+        try:
+            bo = BO(X_init, X_pool, ITERS, BATCH, variant)
+        except Exception as e:
+            run_rows.append({
+                "run_id": run_id,
+                "variant": variant.name,
+                "status": "error",
+                "error": repr(e),
+                "runtime_s": time.time() - t0,
+                "base": base,
+            })
+            continue
+
+        bb = np.array(bo.batch_best, dtype=float)
+        best = float(np.max(bb))
+        cum15 = cum15_from_batch_best(bb)
+
+        eval_df_run = pd.DataFrame(bo.eval_log)
+        y_all = eval_df_run["y"].to_numpy(dtype=float)
+        first330 = eval_index_of_first_hit(y_all, ELITE_THR)
+
+        feats: Dict[str, float] = {}
+        for k in EARLY_K:
+            if len(eval_df_run) >= k:
+                feats.update(early_features(eval_df_run, k))
+
+        run_rows.append({
+            "run_id": run_id,
+            "variant": variant.name,
+            "status": "ok",
+            "runtime_s": time.time() - t0,
+            "base": base,
+            "best": best,
+            "cum15": cum15,
+            "first_hit_330_eval": first330,
+            **feats,
+        })
+
+        for row in bo.eval_log:
+            row2 = dict(row)
+            row2["run_id"] = run_id
+            row2["variant"] = variant.name
+            row2["base"] = base
+            eval_rows.append(row2)
+
+        top_idx = np.argsort(-y_all)[:10]
+        for i in top_idx:
+            r = eval_df_run.iloc[int(i)]
+            x = [
+                float(r["t"]),
+                float(r["pH"]),
+                float(r["f1"]),
+                float(r["f2"]),
+                float(r["f3"]),
+                str(r["celltype"])
+            ]
+            bank.add(x, float(r["y"]))
+
+        if run_id % 5 == 0:
+            pd.DataFrame(run_rows).to_csv(os.path.join(OUT_DIR, "runs_log.csv"), index=False)
+            pd.DataFrame(eval_rows).to_csv(os.path.join(OUT_DIR, "eval_log.csv"), index=False)
+
+        ok = [r for r in run_rows if r.get("status") == "ok"]
+        if len(ok) > 0:
+            avg_best = float(np.mean([r["best"] for r in ok]))
+            avg_cum = float(np.mean([r["cum15"] for r in ok]))
+            print(
+                f"Run {run_id:03d} {variant.name} | best={best:.2f} cum15={cum15:.2f} "
+                f"| avg_best={avg_best:.2f} avg_cum15={avg_cum:.2f}"
+            )
+
+    runs_df = pd.DataFrame(run_rows)
+    eval_df_all = pd.DataFrame(eval_rows)
+
+    runs_df.to_csv(os.path.join(OUT_DIR, "runs_log.csv"), index=False)
+    eval_df_all.to_csv(os.path.join(OUT_DIR, "eval_log.csv"), index=False)
+
+    make_report(runs_df, eval_df_all)
+    make_plots(runs_df, eval_df_all)
+
+
+if __name__ == "__main__":
+    main()
