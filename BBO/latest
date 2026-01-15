@@ -1,0 +1,318 @@
+# =============================================================
+# MLCE_ProfessorLegal_CelltypeCoverage.py
+# GP + EI + Kriging Believer + ML-II warmup
+# Only change vs your baseline:
+#   early celltype coverage in batch 1 (first 3 picks cover all 3 celltypes)
+#
+# No cross-run memory. No elite bank. No probe. No recovery policy.
+# =============================================================
+
+import os, sys, time, random
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve, LinAlgError
+from scipy.optimize import minimize
+from scipy.stats import norm
+from sobol_seq import i4_sobol
+
+# -------------------------------------------------------------
+# Import virtual lab
+# -------------------------------------------------------------
+sys.path.append(os.path.abspath(
+    r"C:\Imperial\Year 4\ML\Imperial-ML4CE-Course\BatchBayesianOptimization"
+))
+import MLCE_CWBO2025.virtual_lab as virtual_lab
+
+# -------------------------------------------------------------
+# Objective function
+# -------------------------------------------------------------
+def objective_func(X):
+    custom_init = [0, 0.4e9, 0.4e6, 0, 20, 3.5, 0, 1.8]
+    return np.array(virtual_lab.conduct_experiment(X, initial_conditions=custom_init))
+
+# -------------------------------------------------------------
+# Bounds and encoding
+# -------------------------------------------------------------
+bounds = np.array([[30, 40], [6, 8], [0, 50], [0, 50], [0, 50]], dtype=float)
+celltypes = ["celltype_1", "celltype_2", "celltype_3"]
+
+def encode_point(x):
+    t, pH, f1, f2, f3, ct = x
+    cont = [(t-30)/10, (pH-6)/2, f1/50, f2/50, f3/50]
+    cat = [1.0 if ct == c else 0.0 for c in celltypes]
+    return np.array(cont + cat, dtype=float)
+
+def encode_batch(X):
+    return np.vstack([encode_point(x) for x in X])
+
+# -------------------------------------------------------------
+# Sobol init and balanced pool
+# -------------------------------------------------------------
+def make_init_with_offset(n=6, sobol_offset=0, sobol_stride=1):
+    X = []
+    for i in range(n):
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * i)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), celltypes[i % 3]])
+    return X
+
+# -------------------------------------------------------------
+# Sobol init and balanced pool
+# -------------------------------------------------------------
+def make_pool_balanced(n_total=3000, sobol_offset=100, sobol_stride=1):
+    per = n_total // 3
+    X = []
+    for ct_idx, ct in enumerate(celltypes):
+        for j in range(per):
+            idx = ct_idx * per + j
+            u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+            c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+            X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), ct])
+
+    rem = n_total - 3 * per
+    for r in range(rem):
+        idx = 3 * per + r
+        u, _ = i4_sobol(5, sobol_offset + sobol_stride * idx)
+        c = bounds[:, 0] + u * (bounds[:, 1] - bounds[:, 0])
+        X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), celltypes[r % 3]])
+    return X
+
+def clip_continuous(c):
+    c = np.asarray(c, dtype=float)
+    c = np.maximum(c, bounds[:, 0])
+    c = np.minimum(c, bounds[:, 1])
+    return c
+
+def make_init_biased_no_memory(n_init=6, alpha=2.5, jitter_frac=0.03):
+    """
+    Professor-legal bias:
+    - No cross-run memory (pure RNG)
+    - Bias continuous variables toward the interior (Beta(alpha, alpha))
+    - 2 points per celltype (still 6 total)
+    - Optional small jitter in physical units
+    """
+    assert n_init == 6, "Coursework expects 6 init points"
+
+    span = (bounds[:, 1] - bounds[:, 0])
+    X = []
+
+    # two points per celltype
+    for ct in celltypes:
+        for _ in range(2):
+            u = np.random.beta(alpha, alpha, size=5)  # interior-biased in [0,1]
+            c = bounds[:, 0] + u * span
+
+            # small jitter (keeps it from always sitting in centre-ish bands)
+            if jitter_frac > 0:
+                c = c + np.random.uniform(-jitter_frac, jitter_frac, size=5) * span
+                c = clip_continuous(c)
+
+            X.append([float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), ct])
+
+    # shuffle so order isn't always ct1,ct1,ct2,ct2,ct3,ct3
+    random.shuffle(X)
+    return X
+
+# -------------------------------------------------------------
+# Gaussian Process
+# -------------------------------------------------------------
+class GP:
+    def __init__(self):
+        self.theta = np.log([0.5, 0.5, 1.0, 1e-4])
+        self._bounds = [
+            (-3.0, 2.0),
+            (-3.0, 2.0),
+            (-3.0, 3.0),
+            (-15.0, -1.0),
+        ]
+
+    def kernel(self, A, B, lc, lk, s2):
+        A1, A2 = A[:, :5]/lc, A[:, 5:]/lk
+        B1, B2 = B[:, :5]/lc, B[:, 5:]/lk
+
+        sq = np.sum(A1**2, 1)[:, None] + np.sum(B1**2, 1)[None, :] - 2*A1@B1.T
+        sq += np.sum(A2**2, 1)[:, None] + np.sum(B2**2, 1)[None, :] - 2*A2@B2.T
+        sq = np.maximum(sq, 0.0)
+
+        d = np.sqrt(sq)
+        sd = np.sqrt(5.0) * d
+        return s2 * (1.0 + sd + 5.0*d*d/3.0) * np.exp(-sd)
+
+    def _build_K(self, X, y_std):
+        lc, lk, ls, ln = self.theta
+        K = self.kernel(X, X, np.exp(lc), np.exp(lk), np.exp(2*ls))
+        jitter = 1e-8 + 1e-6*np.var(y_std)
+        K[np.diag_indices(len(X))] += np.exp(2*ln) + jitter
+        return K
+
+    def neg_log_mll(self, theta):
+        old = self.theta
+        self.theta = theta
+        try:
+            K = self._build_K(self.X, self.y)
+            L, _ = cho_factor(K, lower=True)
+            alpha = cho_solve((L, True), self.y)
+            nll = (
+                0.5*self.y@alpha
+                + np.sum(np.log(np.diag(L)))
+                + 0.5*len(self.y)*np.log(2*np.pi)
+            )
+        except LinAlgError:
+            nll = 1e25
+        self.theta = old
+        return nll
+
+    def fit(self, X, y, optimise=True):
+        self.X = X
+        self.m = float(np.mean(y))
+        self.s = float(np.std(y)) if float(np.std(y)) > 1e-9 else 1.0
+        self.y = (y - self.m) / self.s
+
+        if optimise:
+            res = minimize(self.neg_log_mll, self.theta, method="L-BFGS-B", bounds=self._bounds)
+            self.theta = res.x
+
+        K = self._build_K(self.X, self.y)
+        self.L, _ = cho_factor(K, lower=True)
+        self.alpha = cho_solve((self.L, True), self.y)
+
+    def predict(self, Xs):
+        lc, lk, ls, _ = self.theta
+        Kxs = self.kernel(Xs, self.X, np.exp(lc), np.exp(lk), np.exp(2*ls))
+        mu = Kxs @ self.alpha
+        v = cho_solve((self.L, True), Kxs.T)
+        var = np.exp(2*ls) - np.sum(Kxs * v.T, axis=1)
+        return mu*self.s + self.m, np.sqrt(np.maximum(var, 1e-12))*self.s
+
+# -------------------------------------------------------------
+# EI (keep original xi schedule behaviour)
+# -------------------------------------------------------------
+def expected_improvement(mu, sigma, best, xi):
+    z = (mu - best - xi) / (sigma + 1e-9)
+    return (mu - best - xi) * norm.cdf(z) + sigma * norm.pdf(z)
+
+# -------------------------------------------------------------
+# Mark-scheme cum@15
+# -------------------------------------------------------------
+def cum15_from_batch_best(bb):
+    bb = np.asarray(bb, dtype=float)
+    rb = np.maximum.accumulate(bb)
+    return float(np.sum(rb))
+
+# -------------------------------------------------------------
+# BO
+# -------------------------------------------------------------
+class BO:
+    def __init__(self, X_init, X_pool, iters=15, batch=5):
+        self.N_MIN_OPT = 15
+        self.UCB_KAPPA = 1.0
+        self.UCB_PICKS = 2
+        self.DIV_WEIGHT = 0.3
+
+        self.FORCE_COVERAGE_ITERS = 1
+
+        self.pool = X_pool
+        self.enc_pool = encode_batch(X_pool)
+        self.taken = np.zeros(len(X_pool), dtype=bool)
+
+        self.X_obs = list(X_init)
+        self.Y = list(objective_func(X_init))
+
+        self.batch_best = []
+
+        self.gp = GP()
+        self.gp.fit(encode_batch(self.X_obs), np.array(self.Y, dtype=float), optimise=False)
+
+        for batch_num in range(1, iters + 1):
+            fake_X, fake_Y = [], []
+
+            best_real = float(np.max(self.Y))
+            xi_val = float(np.clip(0.2 * np.exp(-0.05 * best_real / 10.0), 0.01, 0.3))
+
+            for pick_idx in range(batch):
+                mu, std = self.gp.predict(self.enc_pool)
+                best = float(np.max(self.Y + fake_Y))
+
+                if (batch_num == 1) and (pick_idx < self.UCB_PICKS):
+                    mu_eff = mu + self.UCB_KAPPA * std
+                else:
+                    mu_eff = mu
+
+                ei = expected_improvement(mu_eff, std, best, xi=xi_val)
+
+                if len(fake_X) > 0:
+                    enc_fake = encode_batch(fake_X)
+                    diff = self.enc_pool[:, None, :] - enc_fake[None, :, :]
+                    dist = np.linalg.norm(diff, axis=2).min(axis=1)
+                    ei = ei * (1.0 + self.DIV_WEIGHT * dist)
+
+                ei[self.taken] = -np.inf
+
+                # coverage only: first 3 picks of batch 1 must be different celltypes
+                if batch_num <= self.FORCE_COVERAGE_ITERS and pick_idx < 3:
+                    chosen_cts = set([x[-1] for x in fake_X])
+                    missing = set(celltypes) - chosen_cts
+                    if len(missing) > 0:
+                        allowed = np.array([self.pool[i][-1] in missing for i in range(len(self.pool))], dtype=bool)
+                        ei[~allowed] = -np.inf
+
+                idx = int(np.argmax(ei))
+                self.taken[idx] = True
+                x_new = self.pool[idx]
+                fake_X.append(x_new)
+
+                mu_fake, _ = self.gp.predict(encode_batch([x_new]))
+                fake_Y.append(float(mu_fake[0]))
+
+                self.gp.fit(
+                    encode_batch(self.X_obs + fake_X),
+                    np.array(self.Y + fake_Y, dtype=float),
+                    optimise=False
+                )
+
+            Y_real = objective_func(fake_X)
+            self.batch_best.append(float(np.max(Y_real)))
+
+            self.X_obs.extend(fake_X)
+            self.Y.extend(Y_real.tolist())
+
+            optimise_now = (len(self.Y) >= self.N_MIN_OPT)
+            self.gp.fit(encode_batch(self.X_obs), np.array(self.Y, dtype=float), optimise=optimise_now)
+
+# -------------------------------------------------------------
+# Run N times independently (no memory)
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    iters = 15
+    batch = 5
+    N_RUNS = 15  # set to 5 for professor, 15 for your sanity check
+
+    best_runs = []
+    cum_runs = []
+
+    for run_idx in range(N_RUNS):
+        base = random.randint(0, 50_000)
+        stride_pool = random.choice([1, 3, 5, 7, 9])
+        stride_init = random.choice([1, 3, 5, 7, 9])
+
+        X_pool = make_pool_balanced(n_total=3000, sobol_offset=base + 10_000, sobol_stride=stride_pool)
+        X_init = make_init_biased_no_memory(n_init=6, alpha=2.5, jitter_frac=0.03)
+
+        t0 = time.time()
+        bo = BO(X_init, X_pool, iters=iters, batch=batch)
+        dt = time.time() - t0
+
+        bb = np.array(bo.batch_best, dtype=float)
+        best = float(bb.max())
+        cum15 = cum15_from_batch_best(bb)
+
+        best_runs.append(best)
+        cum_runs.append(cum15)
+
+        print(f"Run {run_idx+1:02d}/{N_RUNS} | best={best:.3f} | cum@15={cum15:.3f} | time={dt:.1f}s")
+
+    best_runs = np.array(best_runs, dtype=float)
+    cum_runs = np.array(cum_runs, dtype=float)
+
+    print(f"\n=== {N_RUNS}-RUN SUMMARY (professor legal, no memory) ===")
+    print(f"Avg best titre:    {best_runs.mean():.3f} (std {best_runs.std(ddof=1):.3f})")
+    print(f"Avg cum titre@15:  {cum_runs.mean():.3f} (std {cum_runs.std(ddof=1):.3f})")
