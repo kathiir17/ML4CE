@@ -224,11 +224,7 @@ def your_optimization_alg(
     # =========================
     # Optimization loop
     # =========================
-    # =========================
-    # RESET PLOTTING (visual only)
-    # =========================
-    plot_data["episodes"] = [0]
-    plot_data["reward_history"] = [0.0]
+
 
     for episode in tqdm(range(int(max_episodes)), desc="SA optimization"):
         
@@ -345,7 +341,7 @@ def your_optimization_alg(
                 torch.save(best_policy, save_f_path)
         
         plot_data["episodes"].append(episode)
-        plot_data["reward_history"].append(best_reward)
+        plot_data["reward_history"].append(current_reward)
 
         # -----------------------------------------------------------------------------------
         # PLEASE DO NOT MODIFY THE CODE BELOW THIS LINE
